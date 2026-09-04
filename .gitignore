@@ -1,0 +1,8 @@
+# build output
+/tp
+/tp.exe
+
+# test / transfer residue
+*.tptmp
+*.tprlog
+.tpblk

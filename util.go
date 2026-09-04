@@ -1,0 +1,95 @@
+package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"time"
+)
+
+func humanSize(n int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+		TB = GB * 1024
+	)
+	switch {
+	case n >= TB:
+		return fmt.Sprintf("%.2f TB", float64(n)/float64(TB))
+	case n >= GB:
+		return fmt.Sprintf("%.2f GB", float64(n)/float64(GB))
+	case n >= MB:
+		return fmt.Sprintf("%.2f MB", float64(n)/float64(MB))
+	case n >= KB:
+		return fmt.Sprintf("%.2f KB", float64(n)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "tp: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+// errf prints a red [tp] ✗ error to stderr on its own line (leading newline so
+// it doesn't smear onto the remote prompt). Use it for single-line errors; the
+// couple of multi-line diagnostics keep their own Fprintf so the continuation
+// lines stay uncolored.
+func errf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] ✗ "+format+"\033[0m\n", args...)
+}
+
+// sha256FileHandle hashes the file and seeks it back to the start
+func sha256FileHandle(f *os.File) string {
+	h := sha256.New()
+	buf := make([]byte, 512*1024)
+	for {
+		n, err := io.ReadFull(f, buf)
+		h.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	f.Seek(0, io.SeekStart)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func speedStr(mbs float64) string {
+	return fmt.Sprintf("%.2f MB/s", mbs)
+}
+
+// progressTicker computes instantaneous transfer speed with a ~100ms throttle,
+// shared by the !get (download) and !put (upload) progress displays. start
+// primes the baseline at the given byte position; tick(pos) reports whether a
+// progress line is due (>=100ms since the last tick) and the speed since then.
+type progressTicker struct {
+	lastPos  int64
+	lastTick time.Time
+}
+
+func (p *progressTicker) start(pos int64) {
+	p.lastPos = pos
+	p.lastTick = time.Now()
+}
+
+// tick returns (due, speedMbps). due is true once at least 100ms have elapsed
+// since the last tick (and it then updates the baseline); speedMbps is the
+// instantaneous speed since the last tick.
+func (p *progressTicker) tick(pos int64) (bool, float64) {
+	now := time.Now()
+	if now.Sub(p.lastTick) < 100*time.Millisecond {
+		return false, 0
+	}
+	dt := now.Sub(p.lastTick)
+	var speed float64
+	if dt > 0 {
+		speed = float64(pos-p.lastPos) / dt.Seconds() / 1024 / 1024
+	}
+	p.lastPos = pos
+	p.lastTick = now
+	return true, speed
+}
