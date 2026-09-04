@@ -204,7 +204,7 @@ Test coverage:
 - `stat` (GNU or BSD), `wc`, `head`, `mv`, `rm`
 
 **Local requirements**:
-- Linux or macOS (uses unix ioctl)
+- Linux only (uses unix ioctl)
 - Go 1.26+ to build
 
 **Known limitations**:

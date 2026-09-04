@@ -203,7 +203,7 @@ go test ./...
 - `stat`（GNU 或 BSD）、`wc`、`head`、`mv`、`rm`
 
 **本地要求**：
-- Linux 或 macOS（用了 unix ioctl）
+- 仅 Linux（用了 unix ioctl）
 - Go 1.26+ 构建
 
 **已知限制**：
