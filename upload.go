@@ -6,6 +6,7 @@ import (
 	"hash"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -182,6 +183,7 @@ func readPutLogChecksums(logName, localPath string) map[int]string {
 func injectBestEffort(injectCh chan<- []byte, data []byte) {
 	select {
 	case injectCh <- data:
+		atomic.AddInt64(&injectQueued, int64(len(data)))
 	default:
 	}
 }
@@ -262,7 +264,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 							// resumeFrom full blocks is a no-op when the temp already ends
 							// there; skip it once everything is sent.
 							if resumeFrom < totalBlocks {
-								injectCh <- []byte(truncateCmd(qTmp, int64(resumeFrom), setEchoNonce()))
+								if !injectWait(injectCh, []byte(truncateCmd(qTmp, int64(resumeFrom), setEchoNonce()))) {
+									putAbort(suppress, remotePath)
+									return
+								}
 								time.Sleep(200 * time.Millisecond)
 							}
 							fmt.Fprintf(os.Stderr, "\n\033[1;36m[tp] ↻ %s → %s (resume from block %d/%d)\033[0m\n", localPath, remotePath, resumeFrom, totalBlocks)
@@ -361,10 +366,16 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	// ICRNL turns \r into \n, so \r\n would inject a stray empty line that
 	// head -n N would count as data.
 	if !resume {
-		injectCh <- []byte(leadSpace + fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce))
+		if !injectWait(injectCh, []byte(leadSpace+fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce))) {
+			putAbort(suppress, remotePath)
+			return
+		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	injectCh <- []byte(cmdLine)
+	if !injectWait(injectCh, []byte(cmdLine)) {
+		putAbort(suppress, remotePath)
+		return
+	}
 	time.Sleep(300 * time.Millisecond) // let head start reading
 
 	// Per-block logging state (only active when logMode == 1). We hash each 4MiB
@@ -469,6 +480,24 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	// screen; we only stop suppressing once the select returns.
 
 	fmt.Fprintln(os.Stderr)
+
+	// tp has handed every byte to the pty, but that is not the same as the remote
+	// having received them: tp's injection queue plus the pty buffer can hold
+	// hundreds of kilobytes, which through a bastion that paces input is minutes
+	// of unread data. Saying "sent" and starting the verify clock at that moment
+	// turns a perfectly healthy transfer into a spurious "verification timed
+	// out", so drain first and say what we are waiting on while we do it.
+	if !waitInjectDrained(func(n int64) {
+		if n > 0 {
+			fmt.Fprintf(os.Stderr, "\r\033[1;33m[tp] ↑\033[0m link is slower than tp can read: %s still queued   ", humanSize(n))
+		} else {
+			fmt.Fprint(os.Stderr, "\r\033[K")
+		}
+	}) {
+		putAbort(suppress, remotePath)
+		return
+	}
+
 	elapsed := time.Since(start).Seconds()
 	var speed float64
 	if elapsed > 0 {
@@ -477,14 +506,36 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	fmt.Fprintf(os.Stderr, "\033[1;33m[tp] sent %s (%.1fs, %s avg) → %s, verifying...\033[0m\n",
 		humanSize(sent), elapsed, speedStr(speed), remotePath)
 
-	// Wait for the remote's checksum. Generous timeout: after the last chunk
-	// is accepted, the remote still has to drain its command queue and run
-	// the final decode+hash on slow machines. A 1s heartbeat keeps the user
-	// informed during this wait so it doesn't look stuck.
+	// Wait for the remote's checksum. The clock starts here, with every byte
+	// delivered to the link, so it measures what the remote is doing: draining its
+	// queue, decoding, hashing. Hashing scales with the file, so the budget does.
+	//
+	// But tp cannot see past its own end of the link: on a bastion that paces
+	// input, the bytes tp already wrote can still be minutes away from the remote,
+	// and nothing tp observes says so. The DONE marker is the only real proof. So
+	// the first budget expiring does NOT declare failure — it changes the message
+	// and keeps waiting. A false "timed out" resets the terminal mid-transfer and
+	// leaves a file the user cannot trust, which is worse than waiting; measured
+	// behaviour was a perfectly good 12 KB upload reported as failed, with DONE
+	// landing one second later.
+	verifyBudget := 30*time.Second + time.Duration(fileSize/tpBlockSize)*2*time.Second
+	if v := os.Getenv("TP_VERIFY_TIMEOUT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			verifyBudget = time.Duration(n) * time.Second
+		}
+	}
+	// Hard stop, so a remote that really did die does not hang tp forever.
+	verifyCap := max(10*time.Minute, 20*verifyBudget)
+	if v := os.Getenv("TP_VERIFY_CAP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			verifyCap = time.Duration(n) * time.Second
+		}
+	}
 	verifyStart := time.Now()
 	heartbeat := time.NewTicker(time.Second)
 	defer heartbeat.Stop()
-	timeout := time.After(30 * time.Second)
+	timeout := time.After(verifyBudget)
+	slowNotice := false
 	var remoteSha string
 	gotResult := false
 	timedOut := false
@@ -493,7 +544,15 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		case remoteSha = <-resultCh:
 			gotResult = true
 		case <-timeout:
-			timedOut = true
+			if slowNotice {
+				timedOut = true
+				break
+			}
+			// First expiry: say what is likely going on and keep waiting.
+			slowNotice = true
+			timeout = time.After(verifyCap - verifyBudget)
+			fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ⚠ no answer after %.0fs; the remote may still be receiving through a slow link, waiting up to %.0fm (Ctrl+C to give up)\033[0m\n",
+				verifyBudget.Seconds(), verifyCap.Minutes())
 		case <-heartbeat.C:
 			if atomic.LoadInt32(&linkDead) == 1 {
 				atomic.StoreInt32(suppress, 0)

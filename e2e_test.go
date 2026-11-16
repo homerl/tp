@@ -23,6 +23,20 @@ import (
 	"github.com/creack/pty"
 )
 
+// TestMain shrinks the link-stall window for the whole suite. Production waits a
+// full minute of zero write progress before calling a link dead; a test that gets
+// its injection accounting wrong would then burn that minute on every wait (and
+// the suite would look hung rather than wrong). Five seconds is still longer than
+// anything in the suite legitimately stalls, and turns the next such mistake into
+// a fast failure.
+func TestMain(m *testing.M) {
+	restore := injectStallLimit
+	injectStallLimit = 5 * time.Second
+	code := m.Run()
+	injectStallLimit = restore
+	os.Exit(code)
+}
+
 // putResult captures the outcome of a simulated !put over a pty chain.
 type putResult struct {
 	completed bool // remote reported the TPDone marker with correct sha
@@ -348,12 +362,9 @@ func TestPTYDownloadRoundTrip(t *testing.T) {
 		}
 	}()
 
+	resetInject()
 	injectCh := make(chan []byte, 50)
-	go func() {
-		for data := range injectCh {
-			f.Write(data)
-		}
-	}()
+	startInjector(f, injectCh)
 
 	time.Sleep(300 * time.Millisecond) // let bash start
 
@@ -496,12 +507,9 @@ func TestPTYDownloadResumeRoundTrip(t *testing.T) {
 			}
 		}
 	}()
+	resetInject()
 	injectCh := make(chan []byte, 50)
-	go func() {
-		for data := range injectCh {
-			f.Write(data)
-		}
-	}()
+	startInjector(f, injectCh)
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	// Start the download with logging on. checkResumeLog should detect the
@@ -649,14 +657,12 @@ func TestPTYUploadResumeRoundTrip(t *testing.T) {
 
 	// Injector that also counts how many bytes the local pushed toward the
 	// remote — the signal that distinguishes a resume from a fresh re-upload.
-	var injected int64
+	// Snapshot the global delivery counter: what this test hands over is the delta,
+	// which is how we tell a resume from a full re-send.
+	injBase := atomic.LoadInt64(&injectQueued)
+	resetInject()
 	injectCh := make(chan []byte, 50)
-	go func() {
-		for data := range injectCh {
-			atomic.AddInt64(&injected, int64(len(data)))
-			f.Write(data)
-		}
-	}()
+	startInjector(f, injectCh)
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	var suppress int32
@@ -688,7 +694,7 @@ func TestPTYUploadResumeRoundTrip(t *testing.T) {
 	// Prove it actually resumed: a fresh re-upload would inject ~6.7MiB of
 	// base64; a resume injects only block 1 (~1.34MiB) plus a little overhead.
 	// 3MiB is a safe threshold between the two.
-	if inj := atomic.LoadInt64(&injected); inj > 3*1024*1024 {
+	if inj := atomic.LoadInt64(&injectQueued) - injBase; inj > 3*1024*1024 {
 		t.Fatalf("upload did not resume (injected %d bytes, >3MiB means a full re-send)", inj)
 	}
 
@@ -791,14 +797,12 @@ func TestPTYUploadResumeCorruptTail(t *testing.T) {
 		}
 	}()
 
-	var injected int64
+	// Snapshot the global delivery counter: what this test hands over is the delta,
+	// which is how we tell a resume from a full re-send.
+	injBase := atomic.LoadInt64(&injectQueued)
+	resetInject()
 	injectCh := make(chan []byte, 50)
-	go func() {
-		for data := range injectCh {
-			atomic.AddInt64(&injected, int64(len(data)))
-			f.Write(data)
-		}
-	}()
+	startInjector(f, injectCh)
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	var suppress int32
@@ -828,7 +832,7 @@ func TestPTYUploadResumeCorruptTail(t *testing.T) {
 
 	// A tail re-send (block 4 only) is ~5.3MiB of base64; a full re-upload is
 	// ~27MiB. 12MiB sits safely between them.
-	if inj := atomic.LoadInt64(&injected); inj > 12*1024*1024 {
+	if inj := atomic.LoadInt64(&injectQueued) - injBase; inj > 12*1024*1024 {
 		t.Fatalf("upload did not resume from the corrupt tail (injected %d bytes, >12MiB means a full re-send)", inj)
 	}
 
@@ -929,14 +933,12 @@ func TestPTYUploadResumePartialTail(t *testing.T) {
 		}
 	}()
 
-	var injected int64
+	// Snapshot the global delivery counter: what this test hands over is the delta,
+	// which is how we tell a resume from a full re-send.
+	injBase := atomic.LoadInt64(&injectQueued)
+	resetInject()
 	injectCh := make(chan []byte, 50)
-	go func() {
-		for data := range injectCh {
-			atomic.AddInt64(&injected, int64(len(data)))
-			f.Write(data)
-		}
-	}()
+	startInjector(f, injectCh)
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	var suppress int32
@@ -966,7 +968,7 @@ func TestPTYUploadResumePartialTail(t *testing.T) {
 
 	// A tail re-send (block 4 only) is ~5.3MiB of base64; a full re-upload is
 	// ~27MiB. 12MiB sits safely between them.
-	if inj := atomic.LoadInt64(&injected); inj > 12*1024*1024 {
+	if inj := atomic.LoadInt64(&injectQueued) - injBase; inj > 12*1024*1024 {
 		t.Fatalf("upload did not resume from the partial tail (injected %d bytes, >12MiB means a full re-send)", inj)
 	}
 
@@ -1028,12 +1030,9 @@ func TestPutExistsProbeOverPTY(t *testing.T) {
 			}
 		}
 	}()
+	resetInject()
 	injectCh := make(chan []byte, 50)
-	go func() {
-		for d := range injectCh {
-			f.Write(d)
-		}
-	}()
+	startInjector(f, injectCh)
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	probe := func(target string) bool {
@@ -1148,11 +1147,7 @@ func TestPTYPutConfirmRoundTrip(t *testing.T) {
 				}
 			}()
 			injectCh := make(chan []byte, 100)
-			go func() {
-				for d := range injectCh {
-					f.Write(d)
-				}
-			}()
+			startInjector(f, injectCh)
 			time.Sleep(300 * time.Millisecond)
 
 			// Stand in for the stdin reader: answer the prompt when it appears.
@@ -1266,11 +1261,7 @@ func TestPTYGetConfirmRoundTrip(t *testing.T) {
 				}
 			}()
 			injectCh := make(chan []byte, 100)
-			go func() {
-				for d := range injectCh {
-					f.Write(d)
-				}
-			}()
+			startInjector(f, injectCh)
 			time.Sleep(300 * time.Millisecond)
 
 			// Stand in for the stdin reader: answer the prompt when it appears.
@@ -1320,10 +1311,8 @@ func tail(s []byte, n int) string {
 }
 
 // TestPutAbortsWhenLinkDies covers the "ssh died mid-upload" path. A pty write
-// blocks instead of failing once nothing drains it, so the stall watchdog must
-// notice the injection queue stopped moving and end the transfer, rather than
-// pushing 20 MB into a dead pipe and then reporting a misleading
-// "verification timed out".
+// that fails must end the transfer at once: otherwise tp keeps pushing 20 MB
+// into a dead pipe and then reports a misleading "verification timed out".
 func TestPutAbortsWhenLinkDies(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skip("bash not available")
@@ -1353,6 +1342,7 @@ func TestPutAbortsWhenLinkDies(t *testing.T) {
 
 	// Same contract as the real injection writer in cmdSSH: a failed write means
 	// the link is gone; flag it and keep draining so senders never wedge.
+	resetInject()
 	injectCh := make(chan []byte, 50)
 	go func() {
 		for data := range injectCh {
@@ -1363,14 +1353,12 @@ func TestPutAbortsWhenLinkDies(t *testing.T) {
 				return
 			}
 			atomic.AddInt64(&injectSeq, 1)
+			atomic.AddInt64(&injectWritten, int64(len(data)))
 		}
 	}()
 	defer atomic.StoreInt32(&linkDead, 0)
-	// The pty write blocks rather than failing once nothing drains it, so this is
-	// the stall watchdog's job; shrink its window so the test stays quick.
-	restore := injectStallLimit
-	injectStallLimit = 2 * time.Second
-	defer func() { injectStallLimit = restore }()
+	// The abort here comes from the write failing outright, so the suite-wide stall
+	// window (shrunk by TestMain) is not what ends this transfer.
 
 	var suppress int32
 	// Parse the remote's output the way the real session does, so the existence
@@ -1411,14 +1399,21 @@ func TestPutAbortsWhenLinkDies(t *testing.T) {
 		doNoRemotePut(injectCh, &suppress, localPath, filepath.Join(dir, "remote.bin"), 0, "")
 	}()
 
-	time.Sleep(1 * time.Second)                         // mid-transfer
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // the session drops
+	time.Sleep(1 * time.Second) // mid-transfer
+	// Simulate the session dropping. Closing the master is what makes it
+	// deterministic: the next write returns EBADF, the same failure a dead ssh
+	// leaves behind.
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	_ = f.Close()
 
 	select {
 	case <-done:
 		// Good: it noticed and gave up.
 	case <-time.After(15 * time.Second):
 		t.Fatal("upload did not abort after the link died (still pushing bytes into a dead pty)")
+	}
+	if atomic.LoadInt32(&linkDead) != 1 {
+		t.Fatal("a failing pty write was not reported as a dead link")
 	}
 	if atomic.LoadInt32(&suppress) != 0 {
 		t.Fatal("output suppression left on after the abort; the terminal would look dead")

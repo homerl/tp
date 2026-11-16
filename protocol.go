@@ -517,6 +517,7 @@ func waitOneShot[T any](ch chan T, timeout time.Duration) (T, bool) {
 // default. The caller generates the nonce and embeds it in probeCmd so the
 // probe's own echo can be dropped.
 func probeRemote[T any](injectCh chan<- []byte, probeCmd string, timeout time.Duration, register func(ch chan T)) (T, bool) {
+	var zero T
 	ch := make(chan T, 1)
 	putGuard.mu.Lock()
 	register(ch)
@@ -526,7 +527,16 @@ func probeRemote[T any](injectCh chan<- []byte, probeCmd string, timeout time.Du
 		register(nil)
 		putGuard.mu.Unlock()
 	}()
-	injectCh <- []byte(probeCmd)
+	// The timeout is meant to measure how long the REMOTE takes to answer. On a
+	// link that rate-limits input the command itself can take minutes to arrive,
+	// so the clock only starts once tp has actually handed every byte over.
+	if !injectWait(injectCh, []byte(probeCmd)) {
+		return zero, false
+	}
+	if !waitInjectDrained(nil) {
+		dbg("probe: link died before the command was fully delivered: %s", dbgQuote([]byte(probeCmd)))
+		return zero, false
+	}
 	v, ok := waitOneShot(ch, timeout)
 	if !ok {
 		dbg("probe timed out after %v: %s", timeout, dbgQuote([]byte(probeCmd)))

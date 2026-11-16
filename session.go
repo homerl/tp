@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -86,16 +87,130 @@ func dbg(format string, args ...any) {
 // later, so readers poll this and give up at once.
 var linkDead int32
 
-// injectSeq counts successful pty writes. injectStallLimit is how long a
-// transfer is willing to wait for room in the injection queue while the writer
-// completes ZERO writes. A dead-but-open pty blocks in f.Write rather than
-// returning an error (nobody is draining the buffer), which would otherwise
-// wedge an upload forever behind a frozen progress bar. It is a variable, not a
-// constant, so tests can shrink the window.
+// Injection accounting. Handing bytes to the injection queue is NOT the same as
+// the remote having them: a bastion that rate-limits input leaves a backlog
+// sitting in tp's own buffers, and every timeout tp arms too early gets blamed
+// on the remote. So the queue counts bytes in and bytes out, and anything that
+// waits for an answer waits for the backlog to drain first.
+//
+// injectSeq counts completed pty writes and injectWritten the bytes behind them;
+// the writer chunks its writes so both keep ticking even when one huge line takes
+// a long time to push through a slow link. injectStallLimit is how long no
+// progress at all is tolerated before the link is called dead — a dead-but-open
+// pty blocks in f.Write rather than returning an error, which would otherwise
+// wedge a transfer behind a frozen progress bar. Tunable via TP_LINK_STALL
+// (seconds) and a variable so tests can shrink it.
 var (
 	injectSeq        int64
-	injectStallLimit = 30 * time.Second
+	injectQueued     int64
+	injectWritten    int64
+	injectStallLimit = 60 * time.Second
 )
+
+// injectChunk caps how much goes into a single pty write. Small enough that the
+// stall watchdog sees progress often on a slow link; the byte stream the remote
+// receives is identical.
+const injectChunk = 1024
+
+func init() {
+	if v := os.Getenv("TP_LINK_STALL"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			injectStallLimit = time.Duration(n) * time.Second
+		}
+	}
+}
+
+// injectBacklog is how many bytes tp still holds that the remote has not been
+// given yet.
+func injectBacklog() int64 {
+	return atomic.LoadInt64(&injectQueued) - atomic.LoadInt64(&injectWritten)
+}
+
+// resetInject zeroes the injection counters. Only tests need it: the counters are
+// process-wide, and a test that stops its injector early would otherwise leave a
+// phantom backlog for the next one to wait out.
+func resetInject() {
+	atomic.StoreInt64(&injectQueued, 0)
+	atomic.StoreInt64(&injectWritten, 0)
+	atomic.StoreInt64(&injectSeq, 0)
+	atomic.StoreInt32(&linkDead, 0)
+}
+
+// startInjector drains injectCh into w, in chunks, and keeps the byte accounting
+// that injectBacklog reads. There is exactly one implementation on purpose: the
+// tests share it, so the backlog can never disagree with what was really written
+// (a test-local writer used to leave the counters claiming megabytes still
+// undelivered, and every wait then burned the whole stall timeout).
+//
+// A failed write means the link is gone: flag linkDead and keep draining so
+// senders never block forever on a full channel — they notice and abort.
+func startInjector(w io.Writer, injectCh chan []byte) {
+	go func() {
+		for data := range injectCh {
+			total := len(data)
+			for off := 0; off < total; off += injectChunk {
+				n := min(total-off, injectChunk)
+				if _, err := w.Write(data[off : off+n]); err != nil {
+					dbg("inject write failed: %v", err)
+					atomic.StoreInt32(&linkDead, 1)
+					for range injectCh {
+					}
+					return
+				}
+				atomic.AddInt64(&injectWritten, int64(n))
+				atomic.AddInt64(&injectSeq, 1)
+			}
+			dbg("inject %d bytes: %s", total, dbgQuote(data))
+		}
+	}()
+}
+
+// stallWatch expires only while nothing at all is moving, so a throttled link
+// that is slow but alive never trips it.
+type stallWatch struct {
+	last  int64
+	since time.Time
+	limit time.Duration
+}
+
+func newStallWatch() *stallWatch {
+	return &stallWatch{last: atomic.LoadInt64(&injectWritten), since: time.Now(), limit: injectStallLimit}
+}
+
+// stalled reports true once the written-byte counter has sat still for the whole
+// limit; any movement resets the clock.
+func (w *stallWatch) stalled() bool {
+	if now := atomic.LoadInt64(&injectWritten); now != w.last {
+		w.last = now
+		w.since = time.Now()
+		return false
+	}
+	return time.Since(w.since) > w.limit
+}
+
+// waitInjectDrained blocks until every byte tp queued has reached the pty, and
+// reports whether it drained. It gives up only when the backlog stops shrinking
+// for injectStallLimit, so a slow bastion takes longer instead of being declared
+// dead. progress, when non-nil, is called about once a second with the bytes
+// still queued, so a long wait does not read as a hang.
+func waitInjectDrained(progress func(int64)) bool {
+	w := newStallWatch()
+	var lastReport time.Time
+	for injectBacklog() > 0 {
+		if w.stalled() || atomic.LoadInt32(&linkDead) == 1 {
+			return false
+		}
+		if progress != nil && time.Since(lastReport) >= time.Second {
+			progress(injectBacklog())
+			lastReport = time.Now()
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if progress != nil {
+		progress(0)
+	}
+	return true
+}
 
 // injectWait hands data to the injection writer, reporting false when the link
 // is dead or has made no write at all for injectStallLimit. Slow is fine — the
@@ -108,6 +223,7 @@ func injectWait(injectCh chan<- []byte, data []byte) bool {
 		select {
 		case injectCh <- data:
 			timer.Stop()
+			atomic.AddInt64(&injectQueued, int64(len(data)))
 			return true
 		case <-timer.C:
 			timer.Stop()
@@ -353,21 +469,7 @@ func cmdSSH(args []string) int {
 	}()
 
 	// === Dedicated injection writer (prevents deadlock with stdin reader) ===
-	go func() {
-		for data := range injectCh {
-			if _, werr := f.Write(data); werr != nil {
-				// The link is gone. Flag it and keep draining so senders never
-				// block forever on a full channel; they notice linkDead and abort.
-				dbg("inject write failed: %v", werr)
-				atomic.StoreInt32(&linkDead, 1)
-				for range injectCh {
-				}
-				return
-			}
-			atomic.AddInt64(&injectSeq, 1)
-			dbg("inject %d bytes: %s", len(data), dbgQuote(data))
-		}
-	}()
+	startInjector(f, injectCh)
 
 	// === Local stdin → PTY (byte-by-byte for real-time key forwarding) ===
 	go func() {
@@ -527,6 +629,19 @@ func cmdSSH(args []string) int {
 					// Strip ANSI escape sequences (incl. bracketed-paste markers
 					// \x1b[200~ / \x1b[201~) to get the real command text.
 					clean := strings.TrimSpace(string(stripANSI(line)))
+					// "!!get" / "!!put" is the escape hatch: the user means the literal
+					// shell word (a remote alias of that name, a line inside a heredoc),
+					// not tp's command. Drop one "!" and let the remote have it. A bare
+					// "!!" or "!!vim" still falls through untouched as bash history
+					// expansion.
+					if strings.HasPrefix(clean, "!!get") || strings.HasPrefix(clean, "!!put") {
+						if i := bytes.Index(line, []byte("!!")); i >= 0 {
+							line = append(append([]byte{}, line[:i+1]...), line[i+2:]...)
+						}
+						echoSup.push(stripANSI(line))
+						f.Write(line)
+						continue
+					}
 					if strings.HasPrefix(clean, "!get") || strings.HasPrefix(clean, "!put") {
 						parts := strings.Fields(clean)
 						// logMode -1 = "-l not given"; resolved per-action below where the default is

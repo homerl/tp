@@ -48,6 +48,11 @@ Workflow:
 
 Both directions verify sha256 automatically.
 The local 'tp ssh' silently intercepts data - you only see progress bars.
+Write '!!get' / '!!put' to send such a line to the shell instead of tp.
+
+Slow links (some bastions pace pasted input): tp reports how much is still
+queued and waits for the remote instead of failing early. Tunables:
+  TP_LINK_STALL, TP_VERIFY_TIMEOUT, TP_VERIFY_CAP  (seconds)
 
 Debugging:
   TP_DEBUG=1 tp ssh ...                     trace the protocol to stderr

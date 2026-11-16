@@ -59,6 +59,30 @@ Type directly in the `tp ssh` terminal:
 | `-l 0` | Disable, transfer without recording |
 | `-f <file>` | Custom log file path (by default it auto-detects the resume log `<target filename>.tprlog`) |
 
+Double the bang to mean "this is for the shell, not for tp": `!!get foo bar` is
+forwarded to the remote as `!get foo bar`. Use it when a line inside a heredoc or
+a continuation happens to start with `!get`, or when the remote has its own
+command by that name. (A bare `!!` is untouched and stays bash history
+expansion.)
+
+### Slow links and bastions
+
+Some bastion hosts pace pasted input, delivering it a few characters at a time.
+tp reads a file far faster than such a link can carry it, so it now says so
+instead of failing: while its own queue is still backing up you will see
+`link is slower than tp can read: 17 KB still queued`, and if the remote has not
+answered after the first budget it waits longer rather than declaring a transfer
+failed (a false timeout resets the terminal mid-transfer and leaves a file you
+cannot trust — tp has then simply not seen the confirmation yet).
+
+| Variable | Default | Meaning |
+|------|------|------|
+| `TP_LINK_STALL` | `60` | seconds with zero write progress before the link is called dead |
+| `TP_VERIFY_TIMEOUT` | `30` + 2s per 4 MiB | first wait for the remote's checksum |
+| `TP_VERIFY_CAP` | `600` | absolute limit on that wait |
+| `TP_DEBUG` | off | trace the protocol to stderr |
+| `TP_DEBUG_FILE` | off | trace to a file instead (keeps the progress bar clean) |
+
 ### Typical workflow
 
 ```bash
