@@ -425,14 +425,6 @@ func splitMarker(m string) string {
 // re-downloads the file. Where HISTCONTROL is unset this is just a harmless
 // leading space. It must NOT be used on !put base64 data lines: those are read
 // by `head`/`base64 -d`, not by the shell.
-// onlyEscapes reports whether b is nothing but escape sequences (and other
-// non-printing bytes) with at least one escape in it: an arrow key, a Ctrl+R, a
-// function key. Those are readline actions for the remote and must be forwarded
-// the instant they arrive.
-func onlyEscapes(b []byte) bool {
-	return bytes.Contains(b, []byte{0x1b}) && len(bytes.TrimSpace(stripANSI(b))) == 0
-}
-
 const leadSpace = " "
 
 // tpCommands are the in-session transfer commands.

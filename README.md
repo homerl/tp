@@ -153,7 +153,7 @@ Your keyboard
 ┌──────────────────────────────────────────────┐
 │  tp (local process)                          │
 │                                              │
-│  stdin reader ──→ local echo + forward        │
+│  stdin reader ──→ forward keystrokes          │
 │       │                                       │
 │       ├── recognizes get@! / put@! commands     │
 │       │                                       │
@@ -161,7 +161,7 @@ Your keyboard
 │  PTY (tp ↔ ssh)                               │
 │       │                                       │
 │  output reader ──→ parse __TP_*__ tags        │
-│       │         filter remote duplicate echo  │
+│       │         drop echo of a released line  │
 │       │         base64 stream-decode → write  │
 │       ▼                                       │
 │  stdout → your screen                         │
@@ -194,9 +194,38 @@ Your keyboard
 5. The remote verifies the temp file size → renames it to the target → reports sha256 (`__TP_DONE__ <sha>`)
 6. The local side compares sha256; only a match counts as success
 
-### Why duplicate characters aren't shown
+### Who echoes what
 
-tp sets the local terminal to raw mode and does its own echo (`echoInput`), while a queue called `echoSuppressor` matches and swallows the duplicate characters from the remote echo. Whether the remote has ECHO or OPOST on or off, only one copy is displayed.
+One screen, one painter: **the remote shell echoes, tp forwards.** That is the
+same split plain `ssh` uses, and it is the only one that survives line editing.
+tp puts its own terminal in raw mode (so it sees every keystroke) and puts the
+pty it shares with ssh in raw mode too — *except* `ECHO`, which it deliberately
+leaves alone. ssh copies the termios of its own stdin into the SSH `pty-req`, so
+that bit decides whether the **remote** pty echoes, and bash's readline decides
+once per prompt whether it draws anything at all: on a no-echo terminal it
+concludes it is wired to a silent device, and ↑ history recall, Tab completion
+and Ctrl+R then all happen with nothing on the screen — the command still runs,
+so the terminal just looks like it never refreshed.
+
+tp used to clear `ECHO` and echo every keystroke itself. Then the remote had
+nothing to draw, and the two painters never met — until someone pressed ↑, where
+readline had something to show that tp had no way to know about. Local echo also
+double-erased (tp's `\b \b` plus readline's `\b\e[K` wipes one column too many)
+and printed your password in clear text.
+
+Local echo survives in exactly two places, where the bytes genuinely never reach
+the remote: the `get@!` / `put@!` line you are typing, and the y/N overwrite
+answer. A released command line (typed `git status`, held as a possible `get@!`)
+is the one case where tp has already painted bytes the remote is about to echo,
+so it hands them to `echoSuppressor` to swallow that copy.
+
+### Why uploads say `stty -echo`
+
+Now that the remote pty echoes, the kernel would echo every byte of an upload
+back down the link — a 3 MB upload coming back as 4 MB of base64, on the slowest
+link in the path. So the upload command runs `stty -echo` before `head` starts
+reading and `stty echo` before it reports the checksum. Downloads are unaffected
+(tp sends one line, the rest flows the other way).
 
 ### Why tp's commands stay out of your shell history
 
@@ -234,7 +263,7 @@ In the injected command, the tag is split into `__TP_""DONE__` form (empty-strin
 ```
 main.go         entrypoint, command dispatch
 session.go      tp ssh main session: PTY management, goroutine orchestration, !command parsing
-tty.go          local terminal handling: echo, echoSuppressor, ANSI parsing
+tty.go          local terminal handling: pty modes, echoSuppressor, ANSI parsing
 protocol.go     protocol tag parsing, remote probing, nonce
 download.go     get@! implementation: chunked download, stream base64 decode, resumption
 upload.go       put@! implementation: chunked upload, progress, checksums
@@ -274,5 +303,10 @@ Test coverage:
 - Requires an interactive SSH session (not the `ssh host command` mode)
 - Paths can't contain quotes, `$`, backticks, backslashes, or `!` (anti-injection)
 - A single injected command can't exceed 4095 bytes (PTY canonical mode line-buffer limit); very long paths may trigger truncation
-- Many bash shortcuts (line editing, history, etc.) don't work properly, and the echo occasionally misbehaves. Its positioning is "open a bash terminal to frequently upload/download small files," so it hasn't been improved in more complex directions
+- ↑ history recall, Tab completion and Ctrl+R work, because the remote is the one
+  echoing. If a bastion forces its pty to no-echo, typing is invisible — exactly
+  as it would be under plain `ssh`
+- Its positioning is "open a bash terminal to frequently upload/download small
+  files", so it hasn't been improved in more complex directions (no terminal
+  emulator, no screen model behind what it forwards)
 - Only bash has been tested so far; it hasn't been broadly tested against other shells / terminals

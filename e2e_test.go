@@ -21,6 +21,7 @@ import (
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
 )
 
 // TestMain shrinks the link-stall window for the whole suite. Production waits a
@@ -1399,7 +1400,18 @@ func TestPutAbortsWhenLinkDies(t *testing.T) {
 		doNoRemotePut(injectCh, &suppress, localPath, filepath.Join(dir, "remote.bin"), 0, "")
 	}()
 
-	time.Sleep(1 * time.Second) // mid-transfer
+	// Cut the link once the upload is provably in flight. A fixed sleep used to
+	// be safe because the remote echoed every base64 byte back and that paced the
+	// transfer; the upload command now switches that echo off, so a whole 20 MB
+	// can be gone in a third of a second and a one-second sleep would so often
+	// fire after the data was already sent.
+	inFlight := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&injectWritten) < 2*1024*1024 && time.Now().Before(inFlight) {
+		time.Sleep(time.Millisecond)
+	}
+	if atomic.LoadInt64(&injectWritten) < 2*1024*1024 {
+		t.Fatal("the upload never got under way")
+	}
 	// Simulate the session dropping. Closing the master is what makes it
 	// deterministic: the next write returns EBADF, the same failure a dead ssh
 	// leaves behind.
@@ -1417,5 +1429,92 @@ func TestPutAbortsWhenLinkDies(t *testing.T) {
 	}
 	if atomic.LoadInt32(&suppress) != 0 {
 		t.Fatal("output suppression left on after the abort; the terminal would look dead")
+	}
+}
+
+// TestPTYHistoryRecallVisible is the regression test for the invisible ↑.
+//
+// tp puts the pty it shares with ssh into raw mode. If that also clears ECHO,
+// ssh hands the server a no-echo terminal (it copies its own stdin's termios
+// into the pty-req), and bash's readline decides once — at each prompt — that it
+// is wired to a silent device and stops drawing the input line. History recall
+// still recalls, Enter still runs the recalled command, and the screen shows
+// nothing at all: the terminal looks like it is not refreshing.
+//
+// So: type a command, press ↑, and the recalled text must come back down the
+// pty as a redisplay.
+func TestPTYHistoryRecallVisible(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	run := func(t *testing.T, clearEcho bool) string {
+		t.Helper()
+		cmd := exec.Command("bash", "--norc", "--noprofile")
+		f, err := pty.Start(cmd)
+		if err != nil {
+			t.Skipf("cannot start pty: %v", err)
+		}
+		defer func() { _ = cmd.Process.Kill(); _ = f.Close() }()
+
+		term, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS)
+		if err != nil {
+			t.Skipf("tcgetattr: %v", err)
+		}
+		ptyRaw(term) // exactly what tp does to the ssh pty
+		if clearEcho {
+			term.Lflag &^= unix.ECHO // the old tp: local echo instead of remote echo
+		}
+		if err := unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, term); err != nil {
+			t.Skipf("tcsetattr: %v", err)
+		}
+
+		out := &syncBuffer{}
+		go drain(f, out)
+		time.Sleep(300 * time.Millisecond) // let bash print its prompt
+
+		f.Write([]byte("echo recall-me\n"))
+		deadline := time.Now().Add(5 * time.Second)
+		for !bytes.Contains(out.Bytes(), []byte("recall-me")) && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		before := out.Len()
+		f.Write([]byte("\x1b[A")) // ↑
+		time.Sleep(500 * time.Millisecond)
+		return string(out.Bytes()[before:])
+	}
+
+	got := run(t, false)
+	if !strings.Contains(got, "recall-me") {
+		t.Fatalf("history recall drew nothing on screen; readline never redrew the "+
+			"line (↑ would run invisibly). pty output after ↑: %q", got)
+	}
+	if old := run(t, true); strings.Contains(old, "recall-me") {
+		t.Logf("note: with ECHO cleared the recall still redrew (%q); "+
+			"the shell on this machine redraws regardless", old)
+	} else {
+		t.Logf("confirmed: with ECHO cleared the recall is invisible (%q)", old)
+	}
+}
+
+// TestPutCmdLineSilencesRemoteEcho guards the other half of the same fix. With
+// the remote pty echoing (as it now does), the kernel would echo every base64
+// byte tp uploads straight back down the link — double traffic on the slowest
+// link in the path. The upload command turns echo off for the data phase and
+// back on before it reports the checksum.
+func TestPutCmdLineSilencesRemoteEcho(t *testing.T) {
+	line, _ := putCmdLine("/tmp/t", "/tmp/t.tptmp", 4096, 4096, false, "nonce1")
+	off := strings.Index(line, "stty -echo")
+	on := strings.Index(line, "stty echo")
+	head := strings.Index(line, "head -n")
+	done := strings.Index(line, splitMarker(TPDone))
+	if off < 0 || on < 0 {
+		t.Fatalf("no stty toggle in %q", line)
+	}
+	if off > head {
+		t.Error("stty -echo must run before the data starts arriving")
+	}
+	if on > done {
+		t.Error("echo must be restored before __TP_DONE__")
 	}
 }

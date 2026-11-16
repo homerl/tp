@@ -135,7 +135,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 ┌──────────────────────────────────────────────┐
 │  tp (本地进程)                                │
 │                                              │
-│  stdin reader ──→ 本地 echo + 转发           │
+│  stdin reader ──→ 直接转发按键               │
 │       │                                      │
 │       ├── 识别 get@! / put@! 命令              │
 │       │                                      │
@@ -143,7 +143,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 │  PTY (tp ↔ ssh)                              │
 │       │                                      │
 │  output reader ──→ 解析 __TP_*__ 标记        │
-│       │         过滤远端重复 echo             │
+│       │         吞掉已释放命令行的回显        │
 │       │         base64 流式解码 → 写文件      │
 │       ▼                                      │
 │  stdout → 你的屏幕                           │
@@ -176,9 +176,14 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 5. 远端校验临时文件大小 → rename 到目标 → 回报 sha256（`__TP_DONE__ <sha>`）
 6. 本地比对 sha256，通过才算成功
 
-### 为什么不会显示重复字符
+### 谁负责回显
 
-tp 把本地终端设为 raw mode，自己做 echo（`echoInput`），同时用一个 `echoSuppressor` 队列匹配并吞掉远端回显的重复字符。不管远端 ECHO 开没开、OPOST 开没开，显示都只有一份。
+一块屏幕只能有一个人画：**远端 shell 回显，tp 只负责转发**——跟原版 `ssh` 一样的分工，也是唯一能保住行编辑的分工。
+tp 把自己的终端设成 raw mode（这样每个按键都能立刻拿到），把跟 ssh 之间的那个 pty 也设成 raw mode——但 `ECHO` 这一位故意不动。因为 ssh 会把它自己 stdin 的 termios 拄进 SSH 的 `pty-req` 里，这一位决定的是**远端** pty 开不开回显；而 bash 的 readline 每次提示符只会判断一次要不要自己画：在“不回显的终端”上它认定自己接的是一台不发声的机器，于是 ↑ 召回历史、Tab 补全、Ctrl+R 全都会静悄悄发生——命令照旧执行，屏幕上什么都没有，看起来就像终端不刷新。
+
+tp 以前在这里清掉了 `ECHO`，然后自己逐键回显。于是远端没东西可画，两个画家永远碰不上面——直到有人按了 ↑：readline 有东西要画，而 tp 根本无从知道。本地回显还会重复擦除（tp 的 `\b \b` 加上 readline 的 `\b\e[K`，多擦一格，把提示符都擦掉一角），而且会把你的密码明文画在屏幕上。
+
+现在本地回显只留在两个地方，因为那些字节确实不会到远端：你正在敲的 `get@!` / `put@!` 那一行，以及覆盖确认的 y/N。还有一种例外：你以为是在敲 `get@!`、结果是 `git status`——tp 已经把这些字符画上屏了，交给远端时会把他们放进 `echoSuppressor`，把远端的那一份吞掉。
 
 ### 为什么 tp 的命令不会进你的 shell 历史
 
@@ -210,7 +215,7 @@ tp 传文件是靠往你的会话里注入一条很长的 shell 命令。每条�
 ```
 main.go        入口，命令分发
 session.go     tp ssh 主会话：PTY 管理、goroutine 编排、!命令解析
-tty.go         本地终端处理：echo、echoSuppressor、ANSI 解析
+tty.go         本地终端处理：pty 终端模式、echoSuppressor、ANSI 解析
 protocol.go    协议标记解析、远端探测、nonce
 download.go    !get 实现：分块下载、流式 base64 解码、续传
 upload.go      !put 实现：分块上传、进度、校验
@@ -250,5 +255,7 @@ go test ./...
 - 需要交互式 SSH 会话（非 `ssh host command` 模式）
 - 路径中不能包含引号、`$`、反引号、反斜杠、`!`（防注入）
 - 单条注入命令不能超过 4095 字节（PTY canonical mode 行缓冲限制），极长路径可能触发截断
-- 很多 bash 快捷键（行编辑、历史等）没法正常用，回显偶尔也会抽风。定位就是开一个 bash 终端频繁上传下载小块文件，所以没往更复杂的方向改进
+- ↑ 召回历史、Tab 补全、Ctrl+R 现在都能用，因为回显的是远端。如果遇到某个堡垒机强制把 pty 设成不回显，那打字就是看不见的——跟直接用 `ssh` 一模一样
+- 上传时 tp 会先在远端 `stty -echo`：否则内核会把上传的每一个字节原样回显回来，3 MB 的文件变成 4 MB base64 往回砸，还是砸在这条链路上最慢的那一段
+- 定位就是开一个 bash 终端频繁上传下载小块文件，所以没往更复杂的方向改进（没有终端模拟器，也没有屏幕模型）
 - 目前只测了 bash，没大范围测过其他 shell / 终端

@@ -2,83 +2,55 @@ package main
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// killLocalLine erases cols columns of the local echo on w (the characters the
-// user has typed on the current line) and returns the new column count (0). It
-// is a no-op when cols is 0. Used for Ctrl+U on normal input so the screen
-// clears even when the remote never sends its own clear sequence down the pty.
-func killLocalLine(w io.Writer, cols int) int {
-	if cols > 0 {
-		w.Write(bytes.Repeat([]byte("\b \b"), cols))
-	}
-	return 0
+// ptyRaw turns the tp↔ssh pty into a byte pipe: no line discipline sitting
+// between tp's injected base64 and ssh (ICANON would cap a write at 4096 bytes
+// and buffer partial lines), no signal keys, no output translation.
+//
+// ECHO is deliberately left exactly as it was found. ssh reads the termios of
+// its own stdin and copies them — ECHO included — into the SSH pty-req, so this
+// bit decides whether the REMOTE pty echoes. And bash's readline decides once,
+// at each prompt, whether it draws anything at all: with ECHO off it assumes a
+// silent device and never redraws the input line, which makes ↑ history recall,
+// Tab completion and Ctrl+R run with nothing on the screen. tp no longer echoes
+// keystrokes itself (the remote's echo is the copy the user sees), so there is
+// nothing left for clearing ECHO to buy.
+func ptyRaw(t *unix.Termios) {
+	t.Lflag &^= unix.ICANON | unix.ISIG
+	t.Iflag &^= unix.ICRNL | unix.IXON
+	t.Oflag &^= unix.OPOST
+	t.Cc[unix.VMIN] = 1
+	t.Cc[unix.VTIME] = 0
 }
 
-// echoInput writes a local echo of data to stdout. It is the single source of
-// what the user sees as they type (the PTY and remote echoes are off/suppressed).
-// ANSI escape sequences (arrows, bracketed-paste markers, ...) are skipped — they
-// have no visible glyph. Backspace erases the previous character. The newline is
-// echoed only when echoNL is true: for normal input the remote supplies its own
-// line break (echoing it too would double the newline); `!` commands never reach
-// the remote, so we echo their newline ourselves.
-func echoInput(data []byte, echoNL bool, cols *int) {
-	var out []byte
-	i := 0
-	for i < len(data) {
-		b := data[i]
-		switch {
-		case b == 0x1b: // skip ANSI escape sequences (arrows, bracketed paste, ...)
-			if j := skipEscapeSeq(data, i); j > i {
-				i = j
-				continue
-			}
-			i++ // lone/truncated ESC
-		case b == 0x08 || b == 0x7f: // backspace / DEL: erase previous char
-			if cols != nil && *cols > 0 {
-				out = append(out, '\b', ' ', '\b')
-				*cols--
-			}
-			// If nothing is left to erase (cursor at line start), swallow the
-			// backspace so it can't smear the prompt. The remote still receives it
-			// and its own line discipline ignores it there as well.
-			i++
-		case b == '\n':
-			if echoNL {
-				out = append(out, '\r', '\n')
-			}
-			if cols != nil {
-				*cols = 0
-			}
-			i++
-		case b >= 0x20: // printable (ASCII + UTF-8)
-			out = append(out, b)
-			if cols != nil {
-				*cols++
-			}
-			i++
-		default: // other control chars: no visible glyph
-			i++
-		}
-	}
-	if len(out) > 0 {
-		os.Stdout.Write(out)
-	}
+// hasGlyph reports whether a read carries at least one character with a visible
+// glyph once the ANSI escape sequences are stripped. A read without any — a lone
+// Tab, a lone Enter, an arrow key, Ctrl+R — is a readline action, never the start
+// of a tp command, and must go straight to the remote: the command buffer keeps
+// printable bytes only, so holding such a read simply loses the key.
+func hasGlyph(b []byte) bool {
+	return len(bytes.TrimFunc(stripANSI(b), func(r rune) bool {
+		return r < 0x20 || r == 0x7f
+	})) > 0
 }
 
-// echoSuppressor makes local echo the single source of truth for what the user
-// types. We always echo keystrokes locally (echoInput); the remote shell often
-// echoes them back too, which would be a duplicate. push() records the printable
-// characters we sent; tryConsume() lets the output reader drop the remote's copy
-// of each one. As soon as an incoming byte doesn't match the next expected echo,
-// the queue is cleared (the echo is finished, or never coming on this link), so
-// real command output is never swallowed. This works whether or not the remote
-// echoes at all.
+// echoSuppressor makes the local echo of a released command line the single
+// source of truth for the characters it already painted. tp echoes those bytes
+// itself while it is deciding whether the line is a transfer command; the remote
+// shell echoes them back once they are handed over, which would be a duplicate.
+// push() records the printable characters handed over; tryConsume() lets the
+// output reader drop the remote's copy of each one. As soon as an incoming byte
+// doesn't match the next expected echo, the queue is cleared (the echo is
+// finished, or never coming on this link), so real command output is never
+// swallowed. Ordinary typing is not pushed at all: the remote's echo is the only
+// copy the user sees, exactly as under plain ssh.
 type echoSuppressor struct {
 	mu sync.Mutex
 	q  []byte

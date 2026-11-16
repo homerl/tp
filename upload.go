@@ -44,7 +44,13 @@ func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool, non
 		redirect = ">>"
 	}
 	line := leadSpace + fmt.Sprintf(
-		"head -n %d | base64 -d %s %s 2>/dev/null; [ \"$(wc -c < %s 2>/dev/null)\" = \"%d\" ] && mv -f %s %s; rm -f %s; echo %s \"#%s\" $(sha256sum %s 2>/dev/null | awk '{print $1}')\n",
+		// stty -echo first: the remote pty echoes what it is sent, and the whole
+		// base64 body would otherwise come straight back down the link — double
+		// traffic on the slowest link in the path, and a reader that has to chew
+		// through every byte twice. The command line itself is already typed in by
+		// the time stty runs, so its own echo (dropped by nonce) is unaffected, and
+		// the shell restores echo before it reports __TP_DONE__.
+		"stty -echo 2>/dev/null; head -n %d | base64 -d %s %s 2>/dev/null; [ \"$(wc -c < %s 2>/dev/null)\" = \"%d\" ] && mv -f %s %s; rm -f %s; stty echo 2>/dev/null; echo %s \"#%s\" $(sha256sum %s 2>/dev/null | awk '{print $1}')\n",
 		n, redirect, qTmp, qTmp, fileSize, qTmp, qTarget, qTmp, splitMarker(TPDone), nonce, qTarget)
 	return line, n
 }
@@ -596,7 +602,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		// the temp files (this line queues behind anything still pending).
 		injectBestEffort(injectCh, []byte{3})
 		injectBestEffort(injectCh, []byte("\n"))
-		injectBestEffort(injectCh, []byte(leadSpace+fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce)))
+		// The upload may have been interrupted between `stty -echo` and its
+		// restore, so put echo back before anything else — a shell you cannot see
+		// yourself type in is a worse surprise than a leftover temp file.
+		injectBestEffort(injectCh, []byte(leadSpace+fmt.Sprintf("stty echo 2>/dev/null; rm -f %s 2>/dev/null #%s\n", qTmp, nonce)))
 		fmt.Fprintf(os.Stderr, "\033[1;33m[tp] ⚠ verification timed out; terminal reset, check %s manually\033[0m\n", remotePath)
 	}
 

@@ -305,33 +305,62 @@ func cmdSSH(args []string) int {
 	sshArgs := args[1:]
 
 	cmd := exec.Command("ssh", append([]string{host}, sshArgs...)...)
-	f, err := pty.Start(cmd)
+
+	// Open the pty by hand rather than with pty.Start, so that the terminal modes
+	// and the window size below are already in place when ssh starts: ssh reads
+	// the termios of its own stdin and hands them to the server in the pty-req, so
+	// whatever the pty says at that instant becomes the REMOTE shell's terminal.
+	f, tty, err := pty.Open()
 	if err != nil {
-		fatalf("start ssh: %v", err)
+		fatalf("open pty: %v", err)
 	}
 	defer f.Close()
-	dbg("session start: ssh %s", strings.Join(args, " "))
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
 
-	// Set local PTY (tp ↔ ssh) to raw mode:
-	// - ECHO off: we do our own local echo (echoInput) as the single source and
-	//   suppress the remote's duplicate via echoSuppressor. Relying on either the
-	//   PTY or the remote alone is unreliable across nested/multi-hop links.
+	// Set the local PTY (tp ↔ ssh) to raw mode:
 	// - No ICANON (no 4096-byte line limit, needed for long base64 lines)
-	// - No ICRNL (ssh handles line endings)
+	// - No ICRNL / IXON (ssh handles line endings; XON/XOFF would eat ^Q and ^S)
+	// - No OPOST (tp does its own \n -> \r\n with ensureCRLF)
+	//
+	// ECHO stays ON, and that is the whole reason line editing works. ssh copies
+	// this ECHO bit into the pty-req, so it decides whether the REMOTE pty echoes
+	// — and bash's readline decides once, at startup, whether it draws anything:
+	// with ECHO off it concludes it is wired to a silent device and from then on
+	// ↑ history recall, Tab completion and Ctrl+R all happen with nothing on the
+	// screen. The command still runs, so it looks like tp swallowed the redraw.
+	// (tp used to clear ECHO here because it echoed every keystroke itself; that
+	// turned a local-echo shortcut into permanently invisible line editing.)
+	//
+	// Keeping it on costs nothing on this side: ssh puts the pty into raw mode
+	// itself as soon as its loop starts, so the line discipline never echoes tp's
+	// own writes back into the output reader.
 	if termios, err := unix.IoctlGetTermios(int(f.Fd()), unix.TCGETS); err == nil {
-		termios.Lflag &^= unix.ICANON | unix.ISIG | unix.ECHO
-		termios.Iflag &^= unix.ICRNL | unix.IXON
-		termios.Oflag &^= unix.OPOST
-		termios.Cc[unix.VMIN] = 1
-		termios.Cc[unix.VTIME] = 0
+		ptyRaw(termios)
 		unix.IoctlSetTermios(int(f.Fd()), unix.TCSETS, termios)
 	}
+
+	// Match local terminal size, before ssh reads it for the pty-req.
+	if w, h, err := term.GetSize(int(os.Stdin.Fd())); err == nil {
+		pty.Setsize(f, &pty.Winsize{Rows: uint16(h), Cols: uint16(w)})
+	}
+
+	if err := cmd.Start(); err != nil {
+		tty.Close()
+		fatalf("start ssh: %v", err)
+	}
+	// ssh has its own copy of the slave now; ours has to go, or the pty would
+	// still have a writer after ssh dies and the output reader would never see EOF.
+	tty.Close()
+	dbg("session start: ssh %s", strings.Join(args, " "))
 
 	// Put the user's terminal into raw mode (like ssh does) so every keystroke —
 	// including Ctrl+C — is delivered to us immediately instead of being
 	// line-buffered by the local tty. With ISIG off, a lone Ctrl+C is forwarded
 	// to the remote; a second press within ctrlCExitWindow quits tp (handled in
-	// the stdin reader below). Local ECHO is off (see echoInput/echoSuppressor).
+	// the stdin reader below). Local ECHO is off because the remote echoes — the
+	// same split ssh uses; two programs painting the same keystroke is how you
+	// get doubled characters and doubled erases.
 	//
 	// We keep the ORIGINAL termios and always restore it — on normal exit (defer),
 	// on SIGTERM/SIGINT (handler below), and on double Ctrl+C — so a killed tp
@@ -475,12 +504,6 @@ func cmdSSH(args []string) int {
 	go func() {
 		buf := make([]byte, 4096)
 		var pendingLine []byte
-		// echoedCols tracks how many visible columns we've echoed on the current
-		// input line (normal-branch commands). It lets us stop echoing backspaces
-		// once the cursor reaches the start of the line, so backspacing into the
-		// prompt doesn't smear it (the remote's own line discipline already refuses
-		// to delete the prompt; we just mirror that in our local echo).
-		echoedCols := 0
 
 		// ISIG is off and the tty is raw, so Ctrl+C shows up here as a literal
 		// 0x03 byte rather than raising SIGINT. Forward a lone press to the
@@ -526,14 +549,13 @@ func cmdSSH(args []string) int {
 				// read is wrapped in bracketed-paste markers, or the text could still grow
 				// into a tp command ("get@! …" starts with an ordinary letter, so it needs
 				// this gate rather than a first-byte test).
-				// An escape sequence on its own (arrow keys, Ctrl+R, ...) is an
-				// immediate action for the remote's readline, never the start of a
-				// command. Buffering it — which the empty text it leaves behind would
-				// otherwise do, since "" prefixes every command — is what makes history
-				// recall run invisibly: the recall happens, but the redraw is held.
+				// Keys with no glyph of their own (arrow keys, Ctrl+R, Tab, an empty Enter)
+				// are immediate actions for the remote's readline and can never start a tp
+				// command. Buffering one loses it — the buffer only keeps printable bytes —
+				// which is how Tab completion never reached the shell at all.
 				if len(pendingLine) > 0 || isBangStart(data) ||
 					bytes.HasPrefix(data, []byte("\x1b[200~")) ||
-					(!onlyEscapes(data) && couldBeTpCommand(string(data))) {
+					(hasGlyph(data) && couldBeTpCommand(string(data))) {
 					// A `!` command — typed directly, indented, or wrapped in
 					// bracketed-paste markers. It never reaches the remote, so we echo it
 					// ourselves AND buffer it with basic line editing (backspace, Ctrl+U
@@ -596,42 +618,27 @@ func cmdSSH(args []string) int {
 					if len(pendingLine) > 0 && bytes.IndexByte(pendingLine, '\n') < 0 &&
 						!couldBeTpCommand(string(pendingLine)) {
 						dbg("pendingLine released: %q", pendingLine)
-						for _, b := range pendingLine {
-							if b >= 0x20 && b != 0x7f {
-								echoedCols++
-							}
-						}
 						echoSup.push(pendingLine)
 						f.Write(pendingLine)
 						pendingLine = nil
 						continue
 					}
 				} else {
-					// Normal input: local echo (always on) + forward. The remote may
-					// also echo; echoSup drops the duplicate in the output reader.
-					// We don't echo the Enter key — the remote supplies its own break.
+					// Normal input: forward it and show whatever comes back. The remote
+					// shell is the single source of truth for the screen, exactly as
+					// under plain ssh — it echoes what you type and redraws the line
+					// whenever readline edits it. tp must not paint its own copy on top:
+					// two painters, one screen, is how you get doubled characters and
+					// doubled erases (tp's "\b \b" plus readline's "\b\e[K" wipes one
+					// column too many and eats into the prompt).
 					//
-					// Ctrl+U (kill line): erase our OWN local echo of the current line
-					// so the screen clears even when the remote never sends a clear
-					// sequence back (e.g. its ECHO is off, so nothing comes down the
-					// pty to erase what we painted). We still forward Ctrl+U so the
-					// remote's readline clears its buffer too. Any duplicate clear the
-					// remote does send is harmless — extra backspaces just clamp at the
-					// prompt.
-					if bytes.IndexByte(data, 0x15) >= 0 {
-						echoedCols = killLocalLine(os.Stdout, echoedCols)
-					}
-					// Clear pending echo bytes when sending input that will make the
-					// remote readline generate new screen content (TAB completion,
-					// arrow-key history, etc.). Without this, readline's output can be
-					// mistaken for a still-pending remote echo and silently suppressed —
-					// making completions and history recall invisible in nested or
-					// high-latency setups where echoes haven't round-tripped yet.
+					// Drop any echo still owed from a released command line (see
+					// pendingLine above) before keys that make readline redraw the whole
+					// line (Tab completion, arrows, Ctrl+R): that redraw must never be
+					// mistaken for the echo tp is waiting for and silently swallowed.
 					if bytes.IndexByte(data, 0x09) >= 0 || bytes.IndexByte(data, 0x1b) >= 0 {
 						echoSup.clear()
 					}
-					echoInput(data, true, &echoedCols)
-					echoSup.push(data)
 					f.Write(data)
 					continue
 				}

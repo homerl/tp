@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"golang.org/x/sys/unix"
 )
 
 // simulatePutStreaming mirrors doNoRemotePut's line generation: read 24KB
@@ -730,27 +731,6 @@ func TestCheckResumeLog(t *testing.T) {
 	})
 }
 
-// TestKillLocalLine checks the Ctrl+U local-erase helper: it writes one
-// "\b \b" (backspace-space-backspace) per column so the echoed line is wiped,
-// returns 0, and is a no-op at column 0.
-func TestKillLocalLine(t *testing.T) {
-	var buf bytes.Buffer
-	if got := killLocalLine(&buf, 3); got != 0 {
-		t.Fatalf("cols = %d, want 0", got)
-	}
-	if want := "\b \b\b \b\b \b"; buf.String() != want {
-		t.Fatalf("erase = %q, want %q", buf.String(), want)
-	}
-
-	buf.Reset()
-	if got := killLocalLine(&buf, 0); got != 0 {
-		t.Fatalf("cols = %d, want 0", got)
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("erase = %q, want empty at col 0", buf.String())
-	}
-}
-
 // TestIsYesAnswer checks the overwrite-confirmation answer interpretation.
 func TestIsYesAnswer(t *testing.T) {
 	for _, s := range []string{"y", "Y", "yes", "YES", " Yes ", "y ", "y\n"} {
@@ -1133,21 +1113,58 @@ func TestCouldBeTpCommand(t *testing.T) {
 	}
 }
 
-// TestOnlyEscapes keeps arrow keys and other readline actions flowing straight to
-// the remote. They leave nothing behind once escapes are stripped, and "" is a
-// prefix of every command, so without this check a bare ↑ would be buffered and
-// history recall would run invisibly.
-func TestOnlyEscapes(t *testing.T) {
+// TestHasGlyph decides what the command-buffering gate may hold. A key with no
+// glyph of its own (arrows, Ctrl+R, Tab, an empty Enter, a paste marker) is a
+// readline action for the remote and must be forwarded the instant it arrives:
+// the command buffer keeps printable bytes only, so holding one loses it — which
+// is how Tab completion never reached the shell, and why "" (a prefix of every
+// command) must not be enough to hold a line.
+func TestHasGlyph(t *testing.T) {
 	for _, b := range [][]byte{[]byte("\x1b[A"), []byte("\x1b[B"),
-		[]byte("\x1b[200~\x1b[201~"), []byte("\x1bOA"), {0x1b, '[', 'A', 0x1b, '[', 'B'}} {
-		if !onlyEscapes(b) {
-			t.Errorf("onlyEscapes(%q) = false, want true", b)
+		[]byte("\x1b[200~\x1b[201~"), []byte("\x1bOA"), {0x1b, '[', 'A', 0x1b, '[', 'B'},
+		[]byte("\t"), []byte("\n"), []byte("\x12"), // Ctrl+R
+		{0x03}, {}} {
+		if hasGlyph(b) {
+			t.Errorf("hasGlyph(%q) = true, want false (forward it straight to the remote)", b)
 		}
 	}
 	for _, b := range [][]byte{[]byte("g"), []byte("get@!"), []byte(" \x1b[A x"),
-		[]byte("\x1b[200~get@! f\x1b[201~"), {}, []byte("  "), {0x03}} {
-		if onlyEscapes(b) {
-			t.Errorf("onlyEscapes(%q) = true, want false", b)
+		[]byte("\x1b[200~get@! f\x1b[201~"), []byte(" "), []byte("  \t"), []byte("ls")} {
+		if !hasGlyph(b) {
+			t.Errorf("hasGlyph(%q) = false, want true (may grow into a tp command)", b)
 		}
+	}
+}
+
+// TestPtyRawKeepsEcho is the contract behind visible line editing: the pty tp
+// hands ssh must stay raw but keep ECHO, because ssh copies that bit into the
+// remote pty and readline stops redrawing the input line without it (↑ history
+// recall runs, the command runs, and the screen shows nothing).
+func TestPtyRawKeepsEcho(t *testing.T) {
+	term := unix.Termios{
+		Iflag: unix.ISTRIP | unix.ICRNL | unix.IXON,
+		Oflag: unix.OPOST | unix.ONLCR,
+		Lflag: unix.ECHO | unix.ECHOE | unix.ICANON | unix.ISIG | unix.IEXTEN,
+	}
+	ptyRaw(&term)
+	if term.Lflag&unix.ECHO == 0 {
+		t.Fatal("ECHO cleared: ssh would tell the remote a no-echo terminal and " +
+			"readline would never redraw (invisible ↑ recall / Tab completion)")
+	}
+	for name, flag := range map[string]uint32{"ICANON": unix.ICANON, "ISIG": unix.ISIG} {
+		if term.Lflag&flag != 0 {
+			t.Errorf("%s still set on the ssh pty", name)
+		}
+	}
+	for name, flag := range map[string]uint32{"ICRNL": unix.ICRNL, "IXON": unix.IXON} {
+		if term.Iflag&flag != 0 {
+			t.Errorf("%s still set on the ssh pty", name)
+		}
+	}
+	if term.Oflag&unix.OPOST != 0 {
+		t.Error("OPOST still set: tp does its own \n -> \r\n")
+	}
+	if term.Cc[unix.VMIN] != 1 || term.Cc[unix.VTIME] != 0 {
+		t.Error("read should return on the first byte")
 	}
 }
