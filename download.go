@@ -328,7 +328,14 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 	// the final file, so no overwrite prompt is needed.)
 	if resumeFrom == 0 {
 		if _, err := os.Stat(localPath); err == nil {
-			if !promptOverwrite(localPath, "") {
+			// Spell out that this is the LOCAL file, and where. Inside a nested ssh a
+			// bare "logs.zip already exists" reads like it is talking about the machine
+			// you are typed into, which is the opposite machine.
+			shown := localPath
+			if abs, aerr := filepath.Abs(localPath); aerr == nil {
+				shown = abs
+			}
+			if !promptOverwrite(shown, "locally (the machine you started tp on)") {
 				return
 			}
 		}
