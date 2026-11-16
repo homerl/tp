@@ -170,8 +170,8 @@ func (c *captureState) finalizeBlock() {
 		actualSha = hex.EncodeToString(c.curBlockHash.Sum(nil))
 	}
 	if c.curBlockSha != "" && actualSha != c.curBlockSha {
-		c.b64err = fmt.Errorf("block %d checksum mismatch (want %s… got %s…)",
-			c.curBlockNum, c.curBlockSha[:12], actualSha[:12])
+		c.b64err = fmt.Errorf("block %d checksum mismatch (want %s, got %s)",
+			c.curBlockNum, shortCksum(c.curBlockSha), shortCksum(actualSha))
 	}
 	if c.logFile != nil && c.b64err == nil {
 		fmt.Fprintf(c.logFile, "%d %s\n", c.curBlockNum, actualSha)
@@ -258,6 +258,17 @@ func (c *captureState) finish() {
 	}
 	fmt.Fprintf(os.Stderr, "\n\033[1;32m[tp] ✓ ./%s (%s) %.1fs %s avg\033[0m\n",
 		c.name, humanSize(c.size), elapsed, speedStr(speed))
+}
+
+// shortCksum abbreviates a checksum for error messages. The remote may report
+// crc32 (8 hex chars), xxh64 (16) or sha256 (64) depending on which hash tool
+// it has, so a fixed 12-char slice would run off the end of the shortest one
+// and panic exactly when we are trying to report a problem.
+func shortCksum(s string) string {
+	if len(s) > 12 {
+		return s[:12] + "…"
+	}
+	return s
 }
 
 // isB64Char reports whether c is a standard-base64 alphabet character. Used to
@@ -360,7 +371,7 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 	// (8 = crc32/cksum, 16 = xxh64, 64 = sha256). The temp block file is
 	// written to /tmp if writable, otherwise to the current directory.
 	inject := fmt.Sprintf(
-		"if [ -f %s ]; then TPDIR=/tmp;[ -w /tmp ]||TPDIR=.; SZ=$(stat -c%%s %s 2>/dev/null || stat -f%%z %s 2>/dev/null); T=$(( (SZ + %d) / %d )); if command -v xxh64sum >/dev/null 2>&1; then H=xxh64sum;A='{print $1}'; elif command -v sha256sum >/dev/null 2>&1; then H=sha256sum;A='{print $1}'; elif command -v shasum >/dev/null 2>&1; then H=\"shasum -a 256\";A='{print $1}'; elif command -v sha256 >/dev/null 2>&1; then H=sha256;A='{print $1}'; elif command -v cksum >/dev/null 2>&1; then H=cksum;A='{printf \"%%08x\",$1}'; else echo \"%s no hash tool on remote (need xxh64sum/sha256sum/shasum/sha256/cksum)\"; fi; if [ -n \"$H\" ]; then echo \"%s|%s|$SZ|$T\"; N=%d; while [ $N -lt $T ]; do dd if=%s bs=%d skip=$N count=1 2>/dev/null > $TPDIR/.tpblk; [ -s $TPDIR/.tpblk ] || break; S=$($H $TPDIR/.tpblk 2>/dev/null | awk \"$A\"); echo \"%s $N $S\"; base64 -w 32000 $TPDIR/.tpblk 2>/dev/null || base64 $TPDIR/.tpblk; N=$((N+1)); done; rm -f $TPDIR/.tpblk; echo %s; fi; else echo \"%s no such file: %s\"; fi #%s\n",
+		"if [ -f %s ]; then TPDIR=/tmp;[ -w /tmp ]||TPDIR=.; SZ=$(stat -c%%s %s 2>/dev/null || stat -f%%z %s 2>/dev/null); T=$(( (SZ + %d) / %d )); if command -v xxh64sum >/dev/null 2>&1; then H=xxh64sum;A='{print $1}'; elif command -v sha256sum >/dev/null 2>&1; then H=sha256sum;A='{print $1}'; elif command -v shasum >/dev/null 2>&1; then H=\"shasum -a 256\";A='{print $1}'; elif command -v sha256 >/dev/null 2>&1; then H=sha256;A='{print $1}'; elif command -v cksum >/dev/null 2>&1; then H=cksum;A='{printf \"%%08x\",$1}'; else echo \"%s no hash tool on remote (need xxh64sum/sha256sum/shasum/sha256/cksum)\"; fi; if [ -n \"$H\" ]; then echo \"%s|%s|$SZ|$T\"; N=%d; while [ $N -lt $T ]; do dd if=%s bs=%d skip=$N count=1 2>/dev/null > $TPDIR/.tpblk.$$; [ -s $TPDIR/.tpblk.$$ ] || break; S=$($H $TPDIR/.tpblk.$$ 2>/dev/null | awk \"$A\"); echo \"%s $N $S\"; base64 -w 32000 $TPDIR/.tpblk.$$ 2>/dev/null || base64 $TPDIR/.tpblk.$$; N=$((N+1)); done; rm -f $TPDIR/.tpblk.$$; echo %s; fi; else echo \"%s no such file: %s\"; fi #%s\n",
 		qRemote, qRemote, qRemote, tpBlockSize-1, tpBlockSize, splitMarker(TPError), splitMarker(TPBegin), localPath, resumeFrom, qRemote, tpBlockSize, splitMarker(TPBlock), splitMarker(TPDone), splitMarker(TPError), remotePath, nonce)
 	if len(inject) > 4095 {
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] remote path too long for line-based download\033[0m\n")

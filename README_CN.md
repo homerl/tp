@@ -88,6 +88,28 @@ $ tp ssh jump1 -p 2222          # 代替 ssh jump1 -p 2222
 - 单次 Ctrl+C 转发给远端（中断远端前台进程）
 - 远端 `exit` 也会退出
 
+## 调试
+
+tp 靠两个环境变量输出自己的协议轨迹——故意没做 `--debug` 参数，因为 `tp ssh` 后面的东西是原样透传给 ssh 的，放个 flag 在那儿分不清是给你的还是给 ssh 的。
+
+```
+TP_DEBUG=1 tp ssh host                     # 输出到 stderr
+TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
+```
+
+传文件的时候建议用 `TP_DEBUG_FILE`：进度条是用 `\r` 在同一行反复刷的，debug 打到同一个终端会把它花掉。
+
+日志带时间戳，两个方向都记：tp 注入了什么、远端答了什么、哪些行被认成协议标记、哪些被当成 shell 回显的命令丢掉了：
+
+```
+11:46:52.656 drop echo of injected command (nonce 286ff10b9b170f89)
+11:46:52.659 __TP_TMP_SIZE__ response: size=4194304
+11:46:52.659 probe answered: 4194304
+11:46:53.379 __TP_DONE__ response: remote sha "be27c93d..."
+```
+
+大段数据只留前 120 字节，并告诉你隐掉了多少，所以传 20 MB 不会把有用的几行埋掉。
+
 ## 工作原理
 
 ### 整体架构

@@ -89,6 +89,34 @@ After an interruption (Ctrl+C or network drop), re-run the same `!get` / `!put` 
 - A single Ctrl+C is forwarded to the remote end (interrupts the remote foreground process)
 - The remote `exit` also exits
 
+## Debugging
+
+tp traces its own protocol through two environment variables — there is no
+`--debug` flag on purpose, because everything after `tp ssh` is passed verbatim
+ to ssh, so a flag there could not be told apart from one meant for ssh.
+
+```
+TP_DEBUG=1 tp ssh host                     # trace to stderr
+TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # trace to a file
+```
+
+Prefer `TP_DEBUG_FILE` while a transfer is running: the progress bar repaints a
+single line with `\r`, so debug lines written to the same terminal smear it.
+
+The log is timestamped and shows both directions of the conversation — what tp
+injected, what came back, which lines it recognised as protocol markers, and
+which it dropped as the shell echoing a command back at it:
+
+```
+11:46:52.656 drop echo of injected command (nonce 286ff10b9b170f89)
+11:46:52.659 __TP_TMP_SIZE__ response: size=4194304
+11:46:52.659 probe answered: 4194304
+11:46:53.379 __TP_DONE__ response: remote sha "be27c93d..."
+```
+
+Large payloads are truncated to 120 bytes with the elided count shown, so a
+20 MB download does not bury the interesting lines.
+
 ## How it works
 
 ### Overall architecture

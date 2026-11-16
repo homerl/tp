@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -18,10 +20,11 @@ import (
 	"golang.org/x/term"
 )
 
-
 // ctrlCExitWindow: two Ctrl+C presses closer than this apart exit tp.
 // (ISIG is off on the local tty, so a lone Ctrl+C is forwarded to the
 // remote; only a quick second press is reserved for quitting tp.)
+const ctrlCExitWindow = 1500 * time.Millisecond
+
 // ensureCRLF makes sure every \n in b is preceded by a \r. Remote ptys with
 // OPOST/ONLCR disabled emit bare \n; without the \r the local terminal
 // can't start a new line and everything smears onto one row.
@@ -32,13 +35,88 @@ func ensureCRLF(b []byte) []byte {
 	return bytes.ReplaceAll(b, []byte("\r\r\n"), []byte("\r\n"))
 }
 
-const ctrlCExitWindow = 1500 * time.Millisecond
-
+// tpDebug turns on protocol tracing. Set TP_DEBUG to any non-empty value.
+// A CLI flag would be ambiguous here: everything after `tp ssh` is passed
+// through to ssh verbatim, so `tp ssh host -d` cannot tell tp's flag from
+// ssh's. An environment variable sidesteps that entirely.
 var tpDebug = os.Getenv("TP_DEBUG") != ""
 
-func dbg(format string, args ...interface{}) {
-	if tpDebug {
-		fmt.Fprintf(os.Stderr, "\033[1;35m[tp:dbg]\033[0m "+format+"\n", args...)
+// dbgOut is the lazily opened debug sink. Output goes to TP_DEBUG_FILE when it
+// names a writable file, otherwise to stderr. A file is what you actually want
+// during a transfer: the progress bar repaints a single line with \r, so debug
+// lines written to the same terminal smear it into noise.
+var dbgOut struct {
+	sync.Mutex
+	w     io.Writer
+	color bool
+}
+
+// dbg writes one timestamped trace line. Timestamps matter: most protocol
+// bugs here are ordering/timing bugs between the two reader goroutines.
+func dbg(format string, args ...any) {
+	if !tpDebug {
+		return
+	}
+	dbgOut.Lock()
+	defer dbgOut.Unlock()
+	if dbgOut.w == nil {
+		if p := os.Getenv("TP_DEBUG_FILE"); p != "" {
+			f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+			if err == nil {
+				dbgOut.w = f // a file: no ANSI colours, just plain text
+			} else {
+				fmt.Fprintf(os.Stderr, "tp: debug log %s: %v (logging to stderr instead)\n", p, err)
+				dbgOut.w, dbgOut.color = os.Stderr, true
+			}
+		} else {
+			dbgOut.w, dbgOut.color = os.Stderr, true
+		}
+	}
+	prefix := "[tp:dbg] "
+	if dbgOut.color {
+		prefix = "\033[1;35m[tp:dbg]\033[0m "
+	}
+	fmt.Fprintf(dbgOut.w, "%s%s "+format+"\n",
+		append([]any{prefix, time.Now().Format("15:04:05.000")}, args...)...)
+}
+
+// linkDead flips to 1 when writing to the ssh pty fails (ssh exited, the pipe
+// went away). A transfer that keeps feeding bytes into a dead link would run to
+// completion, then report a misleading "verification timed out" half a minute
+// later, so readers poll this and give up at once.
+var linkDead int32
+
+// injectSeq counts successful pty writes. injectStallLimit is how long a
+// transfer is willing to wait for room in the injection queue while the writer
+// completes ZERO writes. A dead-but-open pty blocks in f.Write rather than
+// returning an error (nobody is draining the buffer), which would otherwise
+// wedge an upload forever behind a frozen progress bar. It is a variable, not a
+// constant, so tests can shrink the window.
+var (
+	injectSeq        int64
+	injectStallLimit = 30 * time.Second
+)
+
+// injectWait hands data to the injection writer, reporting false when the link
+// is dead or has made no write at all for injectStallLimit. Slow is fine — the
+// writer keeps bumping injectSeq, so we keep waiting; no progress at all is what
+// means the link is gone.
+func injectWait(injectCh chan<- []byte, data []byte) bool {
+	for {
+		timer := time.NewTimer(injectStallLimit)
+		before := atomic.LoadInt64(&injectSeq)
+		select {
+		case injectCh <- data:
+			timer.Stop()
+			return true
+		case <-timer.C:
+			timer.Stop()
+			if atomic.LoadInt32(&linkDead) == 1 || atomic.LoadInt64(&injectSeq) == before {
+				dbg("injectWait: no write progress for %v, calling the link dead", injectStallLimit)
+				return false
+			}
+			// Still draining, just slowly: keep waiting.
+		}
 	}
 }
 
@@ -99,12 +177,12 @@ var getLog struct {
 	resumeSize int64  // bytes already in the partial temp file
 }
 
-func cmdSSH(args []string) {
+func cmdSSH(args []string) int {
 	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "usage: tp ssh <host> [ssh_args...]\n")
 		fmt.Fprintf(os.Stderr, "  In-session: !get <remote_path> [local_name]\n")
 		fmt.Fprintf(os.Stderr, "              !put <local_path> [remote_path]\n")
-		os.Exit(1)
+		return 1
 	}
 
 	host := args[0]
@@ -116,6 +194,7 @@ func cmdSSH(args []string) {
 		fatalf("start ssh: %v", err)
 	}
 	defer f.Close()
+	dbg("session start: ssh %s", strings.Join(args, " "))
 
 	// Set local PTY (tp ↔ ssh) to raw mode:
 	// - ECHO off: we do our own local echo (echoInput) as the single source and
@@ -204,10 +283,16 @@ func cmdSSH(args []string) {
 				// whole line to the screen).
 				if !cap.capturing && atomic.LoadInt32(&suppress) == 0 {
 					var kept []byte
+					consumed := 0
 					for _, b := range incoming {
-						if !echoSup.tryConsume(b) {
+						if echoSup.tryConsume(b) {
+							consumed++
+						} else {
 							kept = append(kept, b)
 						}
+					}
+					if consumed > 0 {
+						dbg("echoSup swallowed %d/%d remote echo bytes", consumed, n)
 					}
 					incoming = kept
 				}
@@ -270,7 +355,17 @@ func cmdSSH(args []string) {
 	// === Dedicated injection writer (prevents deadlock with stdin reader) ===
 	go func() {
 		for data := range injectCh {
-			f.Write(data)
+			if _, werr := f.Write(data); werr != nil {
+				// The link is gone. Flag it and keep draining so senders never
+				// block forever on a full channel; they notice linkDead and abort.
+				dbg("inject write failed: %v", werr)
+				atomic.StoreInt32(&linkDead, 1)
+				for range injectCh {
+				}
+				return
+			}
+			atomic.AddInt64(&injectSeq, 1)
+			dbg("inject %d bytes: %s", len(data), dbgQuote(data))
 		}
 	}()
 
@@ -509,5 +604,17 @@ func cmdSSH(args []string) {
 		}
 	}()
 
-	cmd.Wait()
+	// Propagate ssh's own exit status so tp is usable in scripts (it previously
+	// always exited 0, even when ssh itself failed).
+	code := 0
+	if werr := cmd.Wait(); werr != nil {
+		var ee *exec.ExitError
+		if errors.As(werr, &ee) {
+			code = ee.ExitCode()
+		} else {
+			code = 1
+		}
+	}
+	dbg("session end: ssh exit code %d", code)
+	return code
 }

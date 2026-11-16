@@ -15,7 +15,13 @@ jobs:
           go-version-file: go.mod
       - name: install xxhash
         run: sudo apt-get update -y && sudo apt-get install -y xxhash
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "not gofmt-clean:"; echo "$out"; exit 1
+          fi
       - name: vet
         run: go vet ./...
       - name: test
-        run: go test ./...
+        run: go test -race ./...

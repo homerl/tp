@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -49,7 +50,7 @@ func runPutOverPTY(t *testing.T, w ptyWriter, sizeMB int) putResult {
 	if !okT || !okO {
 		t.Fatal("dq rejected test path")
 	}
-	cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false)
+	cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false, "testnonce0000000")
 
 	w.write([]byte(fmt.Sprintf("rm -f %s 2>/dev/null\n", qTmp)))
 	time.Sleep(300 * time.Millisecond)
@@ -66,7 +67,9 @@ func runPutOverPTY(t *testing.T, w ptyWriter, sizeMB int) putResult {
 	}
 
 	res := putResult{output: w.output()}
-	re := regexp.MustCompile(`__TP_DONE__ ([0-9a-f]{64})`)
+	// The remote answers "__TP_DONE__ #<nonce> <sha>" (the tag is what lets tp
+	// discard a reply to a probe that already gave up); accept it with or without.
+	re := regexp.MustCompile("__TP_DONE__ (?:#\\S+ )?([0-9a-f]{64})")
 	deadline := time.Now().Add(120 * time.Second)
 	for time.Now().Before(deadline) {
 		out := w.output()
@@ -1314,4 +1317,110 @@ func tail(s []byte, n int) string {
 		return string(s)
 	}
 	return string(s[len(s)-n:])
+}
+
+// TestPutAbortsWhenLinkDies covers the "ssh died mid-upload" path. A pty write
+// blocks instead of failing once nothing drains it, so the stall watchdog must
+// notice the injection queue stopped moving and end the transfer, rather than
+// pushing 20 MB into a dead pipe and then reporting a misleading
+// "verification timed out".
+func TestPutAbortsWhenLinkDies(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	dir := t.TempDir()
+	localPath := filepath.Join(dir, "big.bin")
+	orig := make([]byte, 20*1024*1024)
+	if _, err := rand.Read(orig); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, orig, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", "--norc", "--noprofile")
+	cmd.Dir = dir
+	// Own process group, so the kill below takes out the `head`/`base64` children
+	// too. As long as any of them holds the pty slave open, writes to the master
+	// keep succeeding into a full buffer instead of failing the way they do when
+	// a real ssh session drops.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	f, err := pty.Start(cmd)
+	if err != nil {
+		t.Skipf("cannot start pty: %v", err)
+	}
+	defer func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); f.Close() }()
+
+	// Same contract as the real injection writer in cmdSSH: a failed write means
+	// the link is gone; flag it and keep draining so senders never wedge.
+	injectCh := make(chan []byte, 50)
+	go func() {
+		for data := range injectCh {
+			if _, werr := f.Write(data); werr != nil {
+				atomic.StoreInt32(&linkDead, 1)
+				for range injectCh {
+				}
+				return
+			}
+			atomic.AddInt64(&injectSeq, 1)
+		}
+	}()
+	defer atomic.StoreInt32(&linkDead, 0)
+	// The pty write blocks rather than failing once nothing drains it, so this is
+	// the stall watchdog's job; shrink its window so the test stays quick.
+	restore := injectStallLimit
+	injectStallLimit = 2 * time.Second
+	defer func() { injectStallLimit = restore }()
+
+	var suppress int32
+	// Parse the remote's output the way the real session does, so the existence
+	// probe is answered and the upload actually gets under way.
+	go func() {
+		buf := make([]byte, 8192)
+		var lineBuf []byte
+		var cap captureState
+		for {
+			n, rerr := f.Read(buf)
+			if n > 0 {
+				lineBuf = append(lineBuf, buf[:n]...)
+				for {
+					idx := bytes.IndexByte(lineBuf, '\n')
+					if idx < 0 {
+						break
+					}
+					line := lineBuf[:idx+1]
+					lineBuf = lineBuf[idx+1:]
+					// Same rule as the real session: while a !put streams, drop the
+					// echoed base64 but keep protocol markers.
+					if atomic.LoadInt32(&suppress) == 1 && !mightBeMarker(line) {
+						continue
+					}
+					handleLine(line, &cap)
+				}
+			}
+			if rerr != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond) // let bash start
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		doNoRemotePut(injectCh, &suppress, localPath, filepath.Join(dir, "remote.bin"), 0, "")
+	}()
+
+	time.Sleep(1 * time.Second)                         // mid-transfer
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // the session drops
+
+	select {
+	case <-done:
+		// Good: it noticed and gave up.
+	case <-time.After(15 * time.Second):
+		t.Fatal("upload did not abort after the link died (still pushing bytes into a dead pty)")
+	}
+	if atomic.LoadInt32(&suppress) != 0 {
+		t.Fatal("output suppression left on after the abort; the terminal would look dead")
+	}
 }

@@ -26,6 +26,51 @@ const (
 	TPCksum   = "__TP_CKSUM__"
 )
 
+// tpMarkers lists every marker the output reader recognises.
+var tpMarkers = []string{TPBegin, TPDone, TPError, TPExists, TPBlock, TPTmpSize, TPCksum}
+
+// hasFullMarker reports whether s contains a marker in the form it takes in
+// REMOTE OUTPUT. Injected commands carry split markers (__TP_""DONE__), so their
+// own echo never matches here — which is exactly what lets the nonce filter tell
+// "the shell echoing my command back" apart from "the answer to my command".
+func hasFullMarker(s string) bool {
+	for _, m := range tpMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// splitNonceTag pulls the "#<nonce>" tag out of a marker response's fields. The
+// probes echo that tag (double-quoted, so the shell keeps it instead of treating
+// it as a comment) which lets the reader tell a reply to the command still in
+// flight from a late reply to one that already gave up. Returns the remaining
+// fields and the tag ("" when the response carries none).
+func splitNonceTag(fields []string) ([]string, string) {
+	out := make([]string, 0, len(fields))
+	nonce := ""
+	for _, f := range fields {
+		if nonce == "" && len(f) > 1 && strings.HasPrefix(f, "#") {
+			nonce = f[1:]
+			continue
+		}
+		out = append(out, f)
+	}
+	return out, nonce
+}
+
+// responseIsStale reports whether a tagged response belongs to an earlier
+// command whose probe already timed out. Delivering it to whoever is waiting now
+// would hand them an answer to a different question.
+func responseIsStale(nonce string) bool {
+	if nonce == "" {
+		return false
+	}
+	cur := currentEchoNonce()
+	return cur != "" && nonce != cur
+}
+
 func handleLine(line []byte, cap *captureState) {
 	trimmed := strings.TrimRight(string(line), "\r\n")
 
@@ -65,6 +110,7 @@ func handleLine(line []byte, cap *captureState) {
 				}
 			}
 			cap.b64.reset() // each block is a fresh base64 stream
+			dbg("%s: block %d algo %s", TPBlock, cap.curBlockNum, cap.curBlockAlgo)
 			return
 		}
 		if di := strings.Index(trimmed, TPDone); di >= 0 {
@@ -98,16 +144,24 @@ func handleLine(line []byte, cap *captureState) {
 	// Drop the remote's echo of the command we just injected. It carries our
 	// per-command nonce and would otherwise print the raw (long) command to the
 	// screen. Only checked when not capturing: the echo always arrives before
-	// __TP_BEGIN__ starts a download.
-	if n := currentEchoNonce(); n != "" && strings.Contains(trimmed, n) {
+	// __TP_BEGIN__ starts a download. A line that also holds a complete marker is
+	// the RESPONSE to that command (which echoes the same nonce), so it must not
+	// be swallowed here.
+	if n := currentEchoNonce(); n != "" && strings.Contains(trimmed, n) && !hasFullMarker(trimmed) {
+		dbg("drop echo of injected command (nonce %s)", n)
 		return
 	}
 
 	// __TP_EXISTS__ yes|no — the remote's answer to the !put existence check.
 	// Deliver it to doNoRemotePut; it owns the rest of the guard logic.
 	if idx := strings.Index(trimmed, TPExists); idx >= 0 {
-		parts := strings.Fields(trimmed[idx+len(TPExists):])
+		parts, tag := splitNonceTag(strings.Fields(trimmed[idx+len(TPExists):]))
+		if responseIsStale(tag) {
+			dbg("drop stale %s response (tag %s)", TPExists, tag)
+			return
+		}
 		exists := len(parts) > 0 && parts[0] == "yes"
+		dbg("%s response: exists=%v", TPExists, exists)
 		putGuard.mu.Lock()
 		ch := putGuard.existsCh
 		putGuard.mu.Unlock()
@@ -126,11 +180,16 @@ func handleLine(line []byte, cap *captureState) {
 	// size of the partial temp file). Deliver it to doNoRemotePut; it decides
 	// whether to append the remaining blocks or re-send from scratch.
 	if idx := strings.Index(trimmed, TPTmpSize); idx >= 0 {
-		parts := strings.Fields(trimmed[idx+len(TPTmpSize):])
+		parts, tag := splitNonceTag(strings.Fields(trimmed[idx+len(TPTmpSize):]))
+		if responseIsStale(tag) {
+			dbg("drop stale %s response (tag %s)", TPTmpSize, tag)
+			return
+		}
 		var n int64
 		if len(parts) > 0 {
 			fmt.Sscanf(parts[0], "%d", &n)
 		}
+		dbg("%s response: size=%d", TPTmpSize, n)
 		putGuard.mu.Lock()
 		ch := putGuard.tmpSizeCh
 		putGuard.mu.Unlock()
@@ -151,15 +210,13 @@ func handleLine(line []byte, cap *captureState) {
 	// them against the local log to find the newest intact block to resume from.
 	if idx := strings.Index(trimmed, TPCksum); idx >= 0 {
 		raw := strings.Fields(trimmed[idx+len(TPCksum):])
-		// Drop the trailing #nonce tag (and any stray # field); keep only the
-		// checksum fields.
-		var parts []string
-		for _, f := range raw {
-			if strings.HasPrefix(f, "#") {
-				continue
-			}
-			parts = append(parts, f)
+		// Split off the trailing #nonce tag; the rest are the checksum fields.
+		parts, tag := splitNonceTag(raw)
+		if responseIsStale(tag) {
+			dbg("drop stale %s response (tag %s)", TPCksum, tag)
+			return
 		}
+		dbg("%s response: %d checksums", TPCksum, len(parts))
 		putGuard.mu.Lock()
 		ch := putGuard.cksumCh
 		putGuard.mu.Unlock()
@@ -178,6 +235,7 @@ func handleLine(line []byte, cap *captureState) {
 	// doesn't exist). Report it and don't create a file.
 	if idx := strings.Index(trimmed, TPError); idx >= 0 {
 		msg := strings.TrimSpace(trimmed[idx+len(TPError):])
+		dbg("%s from remote: %s", TPError, msg)
 		errf("%s", msg)
 		return
 	}
@@ -206,6 +264,7 @@ func handleLine(line []byte, cap *captureState) {
 		cap.name = name
 		cap.blocksize = tpBlockSize
 		cap.tmpName = name + ".tptmp"
+		dbg("%s: name=%q size=%d blocks=%d", TPBegin, name, cap.totalSize, cap.totalBlocks)
 
 		// Read the logging/resume config (set by doNoRemoteGet before inject).
 		getLog.mu.Lock()
@@ -281,11 +340,16 @@ func handleLine(line []byte, cap *captureState) {
 		pendingPut.mu.Unlock()
 
 		if ch != nil {
-			parts := strings.Fields(trimmed[idx+len(TPDone):])
+			parts, tag := splitNonceTag(strings.Fields(trimmed[idx+len(TPDone):]))
+			if responseIsStale(tag) {
+				dbg("drop stale %s response (tag %s)", TPDone, tag)
+				return
+			}
 			remoteSha := ""
 			if len(parts) > 0 {
 				remoteSha = parts[0]
 			}
+			dbg("%s response: remote sha %q", TPDone, remoteSha)
 			// Non-blocking: never stall the output-reader goroutine (which drives
 			// all terminal I/O) on a full channel.
 			select {
@@ -368,23 +432,24 @@ func currentEchoNonce() string {
 }
 
 // existsProbe reports whether the (dq-quoted) target exists, as
-// "__TP_EXISTS__ yes|no".
+// "__TP_EXISTS__ #<nonce> yes|no". The quoted nonce tag rides back in the answer
+// so a reply to an already-abandoned probe is recognisable and dropped.
 func existsProbe(qTarget, nonce string) string {
-	return fmt.Sprintf("[ -e %s ] && echo %s yes || echo %s no #%s\n",
-		qTarget, splitMarker(TPExists), splitMarker(TPExists), nonce)
+	return fmt.Sprintf("[ -e %s ] && echo %s \"#%s\" yes || echo %s \"#%s\" no\n",
+		qTarget, splitMarker(TPExists), nonce, splitMarker(TPExists), nonce)
 }
 
 // tmpSizeProbe reports the size (in bytes) of the upload's partial temp file,
-// as "__TP_TMP_SIZE__ <n>" (0 if missing). !put resume uses it to check the
-// remote's partial file matches the blocks already sent.
+// as "__TP_TMP_SIZE__ #<nonce> <n>" (0 if missing). !put resume uses it to check
+// the remote's partial file matches the blocks already sent.
 func tmpSizeProbe(qTmp, nonce string) string {
-	return fmt.Sprintf("echo %s $(wc -c < %s 2>/dev/null || echo 0) #%s\n",
-		splitMarker(TPTmpSize), qTmp, nonce)
+	return fmt.Sprintf("echo %s \"#%s\" $(wc -c < %s 2>/dev/null || echo 0)\n",
+		splitMarker(TPTmpSize), nonce, qTmp)
 }
 
 // cksumProbe reports the xxh64 checksums of the given 0-based block indices of
-// the upload's partial temp file, as "__TP_CKSUM__ <c1> <c2> ...". Each block
-// is a 4MiB slice hashed with xxh64 (matching the local log); if the remote
+// the upload's partial temp file, as "__TP_CKSUM__ #<nonce> <c1> <c2> ...". Each
+// block is a 4MiB slice hashed with xxh64 (matching the local log); if the remote
 // lacks xxh64sum the fields come back empty and the caller re-uploads.
 func cksumProbe(qTmp string, blocks []int, nonce string) string {
 	list := make([]string, len(blocks))
@@ -392,8 +457,8 @@ func cksumProbe(qTmp string, blocks []int, nonce string) string {
 		list[i] = strconv.Itoa(b)
 	}
 	return fmt.Sprintf(
-		"echo %s $(for i in %s; do dd if=%s bs=4M skip=$i count=1 2>/dev/null | xxh64sum 2>/dev/null | awk '{print $1}'; done | tr '\\n' ' ') #%s\n",
-		splitMarker(TPCksum), strings.Join(list, " "), qTmp, nonce)
+		"echo %s \"#%s\" $(for i in %s; do dd if=%s bs=4M skip=$i count=1 2>/dev/null | xxh64sum 2>/dev/null | awk '{print $1}'; done | tr '\\n' ' ')\n",
+		splitMarker(TPCksum), nonce, strings.Join(list, " "), qTmp)
 }
 
 // truncateCmd truncates the partial temp file to exactly nBlocks complete 4MiB
@@ -434,7 +499,13 @@ func probeRemote[T any](injectCh chan<- []byte, probeCmd string, timeout time.Du
 		putGuard.mu.Unlock()
 	}()
 	injectCh <- []byte(probeCmd)
-	return waitOneShot(ch, timeout)
+	v, ok := waitOneShot(ch, timeout)
+	if !ok {
+		dbg("probe timed out after %v: %s", timeout, dbgQuote([]byte(probeCmd)))
+	} else {
+		dbg("probe answered: %v", v)
+	}
+	return v, ok
 }
 
 // probeRemoteTmpSize asks the remote how big the upload's partial temp file is

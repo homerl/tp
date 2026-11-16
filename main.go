@@ -15,7 +15,7 @@ func main() {
 
 	switch os.Args[1] {
 	case "ssh":
-		cmdSSH(os.Args[2:])
+		os.Exit(cmdSSH(os.Args[2:]))
 	case "version", "--version":
 		fmt.Printf("tp %s\n", version)
 	case "help", "--help", "-h":
@@ -48,5 +48,9 @@ Workflow:
 
 Both directions verify sha256 automatically.
 The local 'tp ssh' silently intercepts data - you only see progress bars.
+
+Debugging:
+  TP_DEBUG=1 tp ssh ...                     trace the protocol to stderr
+  TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log ...  trace to a file (keeps the screen clean)
 `, version)
 }

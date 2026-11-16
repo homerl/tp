@@ -31,7 +31,7 @@ const putDataLineLen = 4000
 //
 // The decoded data goes to a temp file and is moved over the target only if
 // its size matches, so a corrupt transfer never clobbers an existing file.
-func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool) (string, int) {
+func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool, nonce string) (string, int) {
 	// sendSize is how many bytes THIS run transmits (the remaining blocks when
 	// resuming, the whole file otherwise); it sets N, the number of data lines
 	// head will read. fileSize is the final on-disk size the temp must reach
@@ -43,8 +43,8 @@ func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool) (st
 		redirect = ">>"
 	}
 	line := fmt.Sprintf(
-		"head -n %d | base64 -d %s %s 2>/dev/null; [ \"$(wc -c < %s 2>/dev/null)\" = \"%d\" ] && mv -f %s %s; rm -f %s; echo %s $(sha256sum %s 2>/dev/null | awk '{print $1}')\n",
-		n, redirect, qTmp, qTmp, fileSize, qTmp, qTarget, qTmp, splitMarker(TPDone), qTarget)
+		"head -n %d | base64 -d %s %s 2>/dev/null; [ \"$(wc -c < %s 2>/dev/null)\" = \"%d\" ] && mv -f %s %s; rm -f %s; echo %s \"#%s\" $(sha256sum %s 2>/dev/null | awk '{print $1}')\n",
+		n, redirect, qTmp, qTmp, fileSize, qTmp, qTarget, qTmp, splitMarker(TPDone), nonce, qTarget)
 	return line, n
 }
 
@@ -176,6 +176,22 @@ func readPutLogChecksums(logName, localPath string) map[int]string {
 	return cksums
 }
 
+// injectBestEffort queues a small cleanup command, dropping it if the injection
+// queue is full — which only happens when the link is already wedged, in which
+// case there is nobody left to run it anyway.
+func injectBestEffort(injectCh chan<- []byte, data []byte) {
+	select {
+	case injectCh <- data:
+	default:
+	}
+}
+
+// putAbort reports a lost link and hands the terminal back.
+func putAbort(suppress *int32, remotePath string) {
+	atomic.StoreInt32(suppress, 0)
+	fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] ✗ connection lost; %s not uploaded (re-run to resume)\033[0m\n", remotePath)
+}
+
 // doNoRemotePut uploads without tp on the remote. The remote runs a single
 // `head -n N | base64 -d` (see putCmdLine for why that survives multi-hop
 // chains); a corrupt transfer fails the size guard and never clobbers the
@@ -287,16 +303,17 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	}
 
 	nonce := setEchoNonce()
-	cmdLine, numLines := putCmdLine(qTarget, qTmp, sendSize, fileSize, resume)
-	// Tag the command with the nonce so the remote's echo of it can be dropped
-	// (it carries a split marker, which would otherwise reach handleLine).
-	cmdLine = strings.TrimSuffix(cmdLine, "\n") + " #" + nonce + "\n"
+	cmdLine, numLines := putCmdLine(qTarget, qTmp, sendSize, fileSize, resume, nonce)
 	if len(cmdLine) > 4095 {
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] remote path too long for line-based upload\033[0m\n")
 		return
 	}
 
-	// Hash the local file so we can verify after upload
+	// Hash the local file up front so we can verify after the upload. This
+	// deliberately reads the file a second time (the transfer below re-reads it):
+	// that snapshot IS the consistency check. If the file is edited mid-upload,
+	// the bytes we send no longer hash to this value, and the mismatch is reported
+	// instead of a torn file being silently accepted.
 	localSha := sha256FileHandle(lf)
 	// For a resume, skip the blocks we already sent (the remote has them).
 	lf.Seek(int64(resumeFrom)*int64(tpBlockSize), io.SeekStart)
@@ -374,6 +391,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 
 	for {
 		n, rerr := io.ReadFull(lf, buf)
+		if atomic.LoadInt32(&linkDead) == 1 {
+			putAbort(suppress, remotePath)
+			return
+		}
 		if n > 0 {
 			if logF != nil {
 				// Feed the block hash, splitting at the 4MiB boundary if this read
@@ -396,7 +417,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 			sent += int64(n)
 			// Emit complete data lines (copy: pending's backing array is reused)
 			for len(pending) >= putDataLineLen {
-				injectCh <- append(append([]byte{}, pending[:putDataLineLen]...), '\n')
+				if !injectWait(injectCh, append(append([]byte{}, pending[:putDataLineLen]...), '\n')) {
+					putAbort(suppress, remotePath)
+					return
+				}
 				pending = pending[putDataLineLen:]
 				linesSent++
 
@@ -420,7 +444,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	}
 	// Flush the final partial line
 	if len(pending) > 0 {
-		injectCh <- append(append([]byte{}, pending...), '\n')
+		if !injectWait(injectCh, append(append([]byte{}, pending...), '\n')) {
+			putAbort(suppress, remotePath)
+			return
+		}
 		linesSent++
 	}
 	// Log the last (possibly partial) block's checksum, if any bytes were left.
@@ -430,8 +457,8 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	}
 	if linesSent != numLines {
 		// Should be impossible; kill head so the terminal is not left waiting.
-		injectCh <- []byte{3}
-		injectCh <- []byte("\n")
+		injectBestEffort(injectCh, []byte{3})
+		injectBestEffort(injectCh, []byte("\n"))
 		atomic.StoreInt32(suppress, 0)
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] internal error: sent %d lines, expected %d\033[0m\n", linesSent, numLines)
 		return
@@ -468,6 +495,11 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		case <-timeout:
 			timedOut = true
 		case <-heartbeat.C:
+			if atomic.LoadInt32(&linkDead) == 1 {
+				atomic.StoreInt32(suppress, 0)
+				fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] ✗ connection lost while verifying %s\033[0m\n", remotePath)
+				return
+			}
 			fmt.Fprintf(os.Stderr, "\r\033[1;33m[tp] ↑\033[0m verifying… (%.0fs)   ", time.Since(verifyStart).Seconds())
 		}
 	}
@@ -488,9 +520,9 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		// Last resort: interrupt whatever is running and restore the prompt
 		// so the user can continue working in this terminal, then clean up
 		// the temp files (this line queues behind anything still pending).
-		injectCh <- []byte{3}
-		injectCh <- []byte("\n")
-		injectCh <- []byte(fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce))
+		injectBestEffort(injectCh, []byte{3})
+		injectBestEffort(injectCh, []byte("\n"))
+		injectBestEffort(injectCh, []byte(fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce)))
 		fmt.Fprintf(os.Stderr, "\033[1;33m[tp] ⚠ verification timed out; terminal reset, check %s manually\033[0m\n", remotePath)
 	}
 

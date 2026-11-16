@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -72,7 +73,7 @@ func TestPutLineGeneration(t *testing.T) {
 			if !okT || !okO {
 				t.Fatal("dq rejected test path")
 			}
-			cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false)
+			cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false, "testnonce0000000")
 			if len(cmdLine) > 4095 {
 				t.Fatalf("command line too long: %d bytes", len(cmdLine))
 			}
@@ -899,5 +900,152 @@ func TestWaitForQuiet(t *testing.T) {
 	}
 	if elapsed > 600*time.Millisecond {
 		t.Fatalf("returned too late: %v", elapsed)
+	}
+}
+
+// TestHandleLinePerBlockCRC32 covers a remote that has only `cksum`: its
+// checksums are 8 hex chars. The mismatch message used to slice 12 characters
+// out of them, so the code reporting a corrupt block panicked first and took tp
+// down with it. Both the good and the bad path must survive an 8-char checksum.
+func TestHandleLinePerBlockCRC32(t *testing.T) {
+	resetGetLog()
+	dir := t.TempDir()
+	oldWD, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(oldWD)
+
+	data := []byte("crc32 fallback payload")
+	b64 := base64.StdEncoding.EncodeToString(data)
+	cksum := fmt.Sprintf("%08x", crc32.ChecksumIEEE(data)) // 8 hex chars → crc32 path
+
+	var cap captureState
+	handleLine([]byte("__TP_BEGIN__|crc.bin|"+strconv.Itoa(len(data))+"|1\n"), &cap)
+	handleLine([]byte("__TP_BLOCK__ 0 "+cksum+"\n"), &cap)
+	if cap.curBlockAlgo != "crc32" {
+		t.Fatalf("algo = %q, want crc32", cap.curBlockAlgo)
+	}
+	handleLine([]byte(b64+"\n"), &cap)
+	handleLine([]byte("__TP_DONE__\n"), &cap)
+	got, err := os.ReadFile("crc.bin")
+	if err != nil {
+		t.Fatalf("good crc32 block should produce a file: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("mismatch: got %q want %q", got, data)
+	}
+
+	// Corrupt block: must abort cleanly (this is the line that used to panic).
+	var cap2 captureState
+	handleLine([]byte("__TP_BEGIN__|crcbad.bin|"+strconv.Itoa(len(data))+"|1\n"), &cap2)
+	handleLine([]byte("__TP_BLOCK__ 0 "+"deadbeef"+"\n"), &cap2)
+	handleLine([]byte(b64+"\n"), &cap2)
+	handleLine([]byte("__TP_DONE__\n"), &cap2)
+	if _, err := os.Stat("crcbad.bin"); err == nil {
+		t.Fatal("bad crc32 checksum should not produce a file")
+	}
+}
+
+// TestShortCksum pins the abbreviation helper: it must never slice past the end,
+// whatever length hash tool the remote happened to have.
+func TestShortCksum(t *testing.T) {
+	for _, s := range []string{"", "a", "deadbeef", "0123456789abcdef", strings.Repeat("f", 64)} {
+		if got := shortCksum(s); len(got) > 12+len("…") {
+			t.Fatalf("shortCksum(%q) = %q, too long", s, got)
+		}
+	}
+	if shortCksum("deadbeef") != "deadbeef" {
+		t.Fatal("an 8-char checksum must pass through unabbreviated")
+	}
+	if !strings.HasSuffix(shortCksum(strings.Repeat("f", 64)), "…") {
+		t.Fatal("a long checksum should be abbreviated")
+	}
+}
+
+// TestStaleProbeResponseDropped checks the nonce tag on a probe response. A
+// reply to a probe that already timed out must not be handed to the next probe
+// as if it answered a different question.
+func TestStaleProbeResponseDropped(t *testing.T) {
+	echoNonce.mu.Lock()
+	echoNonce.val = "ffffffffffffffff" // the probe currently in flight
+	echoNonce.mu.Unlock()
+	defer func() {
+		echoNonce.mu.Lock()
+		echoNonce.val = ""
+		echoNonce.mu.Unlock()
+	}()
+
+	deliver := func(line string) (bool, bool) {
+		ch := make(chan bool, 1)
+		putGuard.mu.Lock()
+		putGuard.existsCh = ch
+		putGuard.mu.Unlock()
+		defer func() {
+			putGuard.mu.Lock()
+			putGuard.existsCh = nil
+			putGuard.mu.Unlock()
+		}()
+		var cap captureState
+		handleLine([]byte(line), &cap)
+		select {
+		case e := <-ch:
+			return e, true
+		default:
+			return false, false
+		}
+	}
+	// A tagged response from an earlier, abandoned probe: dropped.
+	if _, ok := deliver("__TP_EXISTS__ #1111111111111111 yes\n"); ok {
+		t.Fatal("stale tagged response must not be delivered")
+	}
+	// The response to the probe actually in flight: delivered.
+	if v, ok := deliver("__TP_EXISTS__ #ffffffffffffffff yes\n"); !ok || !v {
+		t.Fatalf("current response not delivered (v=%v ok=%v)", v, ok)
+	}
+	// An untagged response stays accepted (nothing to prove it is stale).
+	if v, ok := deliver("__TP_EXISTS__ no\n"); !ok || v {
+		t.Fatalf("untagged response should still be accepted (v=%v ok=%v)", v, ok)
+	}
+}
+
+// TestProbeCommandsTagResponses checks every probe echoes its nonce tag (quoted,
+// so the shell keeps it instead of eating it as a comment) while keeping the
+// marker split (so the command's own echo cannot misfire).
+func TestProbeCommandsTagResponses(t *testing.T) {
+	const nonce = "abc123def4567890"
+	cases := map[string]string{
+		"exists":   existsProbe(`"/tmp/x"`, nonce),
+		"tmp_size": tmpSizeProbe(`"/tmp/x.tptmp"`, nonce),
+		"cksum":    cksumProbe(`"/tmp/x.tptmp"`, []int{0, 1}, nonce),
+	}
+	for name, cmd := range cases {
+		if !strings.Contains(cmd, `"#`+nonce+`"`) {
+			t.Errorf("%s probe lost its quoted nonce tag: %s", name, cmd)
+		}
+		for _, m := range tpMarkers {
+			if strings.Contains(cmd, m) {
+				t.Errorf("%s probe contains the full marker %s (its echo would misfire)", name, m)
+			}
+		}
+		if !strings.Contains(cmd, "__TP_") {
+			t.Errorf("%s probe lost the __TP_ prefix (mightBeMarker relies on it)", name)
+		}
+	}
+}
+
+// TestSplitNonceTag covers the tag splitter used to validate probe responses.
+func TestSplitNonceTag(t *testing.T) {
+	rest, tag := splitNonceTag([]string{"#abc", "yes"})
+	if tag != "abc" || len(rest) != 1 || rest[0] != "yes" {
+		t.Fatalf("got %v/%q, want [yes]/abc", rest, tag)
+	}
+	rest, tag = splitNonceTag([]string{"c1", "c2"})
+	if tag != "" || len(rest) != 2 {
+		t.Fatalf("untagged fields should pass through: %v/%q", rest, tag)
+	}
+	rest, tag = splitNonceTag(nil)
+	if tag != "" || len(rest) != 0 {
+		t.Fatalf("empty input: %v/%q", rest, tag)
 	}
 }
