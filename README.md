@@ -84,6 +84,78 @@ cannot trust — tp has then simply not seen the confirmation yet).
 | `TP_DEBUG` | off | trace the protocol to stderr |
 | `TP_DEBUG_FILE` | off | trace to a file instead (keeps the progress bar clean) |
 
+### Fast network, glacial screen: the link is metered by lines
+
+A symptom worth recognising before you blame tp: inside the bastion session,
+scrolling back in `screen` crawls — 100 lines can take five minutes, and pasting
+refreshes visibly line by line — yet `scp` a big log to another machine and it
+flies. The bandwidth is there; the *screen path* is not.
+
+This is a well-populated corner of the internet, and the intermediaries all make
+the same trade: they meter by **lines or screenfuls**, not by bytes, because they
+want to stay interactive. The tmux author on why tmux crawls where ssh flies:
+"ssh is happy to fill the TCP buffers and let the terminal chew through it, the
+only thing it cares about responding to is ^C", so tmux slows down once it has
+about eight screenfuls outstanding (`TTY_BLOCK_START` = cols × rows × 8) and
+redraws instead — bigger window, bigger tax. EternalTerminal's flow control is
+literally 1024 lines/second, which is why `cat`-ing a file with no newlines in it
+is suddenly fast. Browser terminals (xterm.js and friends) add their own frame
+rate on top, and lose the backpressure a native terminal gets free from the
+kernel. Bastion vendors hit it themselves: JumpServer shipped a bug where `sz`
+stalled at 99% above ~100 KB.
+
+What it costs tp:
+
+- **Upload — barely affected.** That direction is input, and tp already assumes
+  some bastions drip characters (see `link is slower than tp can read` above).
+  The upload command also runs `stty -echo` on the remote, which matters a lot
+  here: with echo on, the kernel would echo the whole base64 body back and every
+  byte would be rendered twice.
+- **Download — this is the one at risk.** A 4 MiB block leaves the remote as
+  5.6 MB of base64 in 175 long lines (`base64 -w 32000`), so 100 MB is ~4,400
+  newlines: cheap if the meter counts newlines in the stream. But if that shell
+  is inside an *attached* `screen`/`tmux` window, the multiplexer has to draw the
+  stream into its window, and it wraps at the window width: 5.6 MB over 80
+  columns is ~70,000 lines per block, ~1.7 million per 100 MB. That is the
+  difference between a minute and an afternoon.
+
+Measure it before optimising. Run this in the bastion session, once inside
+`screen` and once outside — the difference is what the multiplexer charges:
+
+```bash
+dd if=/dev/zero of=/tmp/50m.bin bs=1M count=50
+
+# 1 pure throughput, nothing ever drawn
+time dd if=/dev/zero bs=1M count=50 2>/dev/null | base64 | wc -c
+
+# 2 the same bytes, but they have to reach the screen
+time base64 -w 0 /tmp/50m.bin > /dev/tty
+
+# 3 what a line costs: 2000 lines vs the same bytes with no newlines
+time seq 1 2000 > /dev/tty
+time seq 1 2000 | tr '\n' ' ' > /dev/tty
+
+# 4 what one round trip costs
+time (for i in $(seq 30); do echo x > /dev/tty; done)
+```
+
+How to read it: 1 fast and 2 slow means the money is charged for *drawing*, and
+tp's downloads pay it. 3's first line far slower than its second means newlines
+are the unit. If 1, 2 and 3 are all fine and only `screen` scrolling is painful,
+your terminal is ugly and tp is fine. Test 4 × the number of lines is your floor.
+
+What you can do about it, biggest lever first:
+
+1. Do big transfers in a shell that is not an attached `screen`/`tmux` window —
+   otherwise every base64 byte is parsed, drawn and re-emitted on its way to you.
+2. Make the window wide (smaller font, 300–400 columns). The multiplexer wraps at
+   the window width, so 4× the columns is 4× fewer lines to draw. tp passes your
+   real window size to the remote, so this reaches all the way through.
+3. Keep bulk output out of the tty: `cmd > /tmp/x 2>&1` then `less /tmp/x`.
+   Bytes that never enter the pty are never metered.
+4. In `screen`, `defbce on` shrinks redraws. Do not reach for `defflow`: XON/XOFF
+   through a chain of proxies tends to lock the session instead.
+
 ### Typical workflow
 
 ```bash
