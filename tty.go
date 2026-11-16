@@ -150,6 +150,11 @@ func skipEscapeSeq(data []byte, start int) int {
 			return start // truncated
 		}
 		return i + 1 // skip the final byte
+	case 'O': // SS3: ESC O final (application-mode arrows, F1-F4)
+		if i+1 >= len(data) {
+			return start // truncated
+		}
+		return i + 2
 	case ']': // OSC: ESC ] ... (BEL or ST)
 		i++
 		for i < len(data) && data[i] != 0x07 {
@@ -254,24 +259,6 @@ func skipJunk(b []byte) int {
 func isBangStart(data []byte) bool {
 	i := skipJunk(data)
 	return i < len(data) && data[i] == '!'
-}
-
-// isLeadingSpace reports whether b is entirely horizontal whitespace (space /
-// tab). Used at line start to hold a possibly-indented `!` command until its
-// first real byte arrives. Deliberately EXCLUDES escape sequences: those (arrow
-// keys, cursor moves, ...) are immediate actions that must be forwarded at once,
-// not held. Bracketed-paste markers are handled separately via an explicit prefix
-// check, since they are the only escapes that legitimately precede a `!` command.
-func isLeadingSpace(b []byte) bool {
-	if len(b) == 0 {
-		return false
-	}
-	for _, c := range b {
-		if c != ' ' && c != '\t' {
-			return false
-		}
-	}
-	return true
 }
 
 // stripANSI removes all ANSI escape sequences (CSI/OSC/Fe) from b, returning the

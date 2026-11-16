@@ -336,18 +336,6 @@ func TestBangDetectionWithBracketedPaste(t *testing.T) {
 	if !isBangStart([]byte("\t!put x y")) {
 		t.Fatal("tab-indented ! should be detected")
 	}
-	// isLeadingSpace: only horizontal whitespace — NOT escape sequences (those are
-	// immediate actions like arrow keys that must be forwarded at once).
-	if !isLeadingSpace([]byte("  ")) || !isLeadingSpace([]byte("\t")) {
-		t.Fatal("whitespace should be leading-space")
-	}
-	if isLeadingSpace([]byte("\x1b[A")) { // arrow key must NOT be held
-		t.Fatal("escape sequence must not be treated as leading space")
-	}
-	if isLeadingSpace([]byte("ls")) || isLeadingSpace([]byte(" l")) {
-		t.Fatal("content byte must not be leading-space")
-	}
-
 	// stripANSI: removes bracketed paste markers, keeps content
 	if got := string(stripANSI([]byte("\x1b[200~!get a b\x1b[201~\n"))); got != "!get a b\n" {
 		t.Fatalf("stripANSI = %q, want %q", got, "!get a b\n")
@@ -1098,5 +1086,68 @@ func TestInjectedCommandsLeadWithSpace(t *testing.T) {
 	dataLine := append(append([]byte{}, bytes.Repeat([]byte("A"), 3000)...), '\n')
 	if bytes.HasPrefix(dataLine, []byte(leadSpace)) {
 		t.Error("base64 data lines must not be space-prefixed")
+	}
+}
+
+// TestTpAction covers the in-session command spellings. "get@!"/"put@!" put the
+// bang at the END of the word, where bash never history-expands it — the reason
+// the leading-bang form was replaced. Matching is by whole word, so a heredoc
+// line or an argument that merely starts with "get" is not a command.
+func TestTpAction(t *testing.T) {
+	for _, w := range []string{"get@!", "put@!"} {
+		if got := tpAction(w); got != w[:3] {
+			t.Errorf("tpAction(%q) = %q, want %q", w, got, w[:3])
+		}
+	}
+	// Legacy spellings keep working.
+	if tpAction("!get") != "get" || tpAction("!put") != "put" {
+		t.Error("legacy !get/!put should still be recognised")
+	}
+	for _, w := range []string{"get@!x", "get", "get@1", "put", "puts", "", "!", "!", "git", "!", "reset@!"} {
+		if got := tpAction(w); got != "" {
+			t.Errorf("tpAction(%q) = %q, want no command", w, got)
+		}
+	}
+}
+
+// TestCouldBeTpCommand gates line buffering: a line is held only while it could
+// still become a command, so typing "git status" is released to the remote after
+// a couple of keystrokes instead of losing readline for the whole line.
+func TestCouldBeTpCommand(t *testing.T) {
+	held := []string{"", "g", "ge", "get", "get@", "get@!", "p", "put@!", "  get@!",
+		"get@! /tmp/x", "put@! a b", "!", "!g", "!get x", "\t put@!",
+		// Held, and that is fine: it starts with a whole command, so tp keeps the
+		// line until Enter, where the whole-word check lets it through to the shell.
+		"get@!x"}
+	for _, s := range held {
+		if !couldBeTpCommand(s) {
+			t.Errorf("couldBeTpCommand(%q) = false, want held", s)
+		}
+	}
+	released := []string{"git", "git status", "grep x", "put_file", "ls", "echo hi",
+		"reset@! f", "python3"}
+	for _, s := range released {
+		if couldBeTpCommand(s) {
+			t.Errorf("couldBeTpCommand(%q) = true, want released to the remote", s)
+		}
+	}
+}
+
+// TestOnlyEscapes keeps arrow keys and other readline actions flowing straight to
+// the remote. They leave nothing behind once escapes are stripped, and "" is a
+// prefix of every command, so without this check a bare ↑ would be buffered and
+// history recall would run invisibly.
+func TestOnlyEscapes(t *testing.T) {
+	for _, b := range [][]byte{[]byte("\x1b[A"), []byte("\x1b[B"),
+		[]byte("\x1b[200~\x1b[201~"), []byte("\x1bOA"), {0x1b, '[', 'A', 0x1b, '[', 'B'}} {
+		if !onlyEscapes(b) {
+			t.Errorf("onlyEscapes(%q) = false, want true", b)
+		}
+	}
+	for _, b := range [][]byte{[]byte("g"), []byte("get@!"), []byte(" \x1b[A x"),
+		[]byte("\x1b[200~get@! f\x1b[201~"), {}, []byte("  "), {0x03}} {
+		if onlyEscapes(b) {
+			t.Errorf("onlyEscapes(%q) = true, want false", b)
+		}
 	}
 }

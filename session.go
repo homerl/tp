@@ -475,11 +475,6 @@ func cmdSSH(args []string) int {
 	go func() {
 		buf := make([]byte, 4096)
 		var pendingLine []byte
-		// atLineStart is true when the next byte typed begins a new line (right
-		// after a submitted Enter, or at session start). Only at line start do we
-		// allow leading whitespace before a `!` command.
-		atLineStart := true
-
 		// echoedCols tracks how many visible columns we've echoed on the current
 		// input line (normal-branch commands). It lets us stop echoing backspaces
 		// once the cursor reaches the start of the line, so backspacing into the
@@ -526,12 +521,19 @@ func cmdSSH(args []string) int {
 					continue
 				}
 
-				// Decide whether this read is (the start of) a local `!` command.
-				// Buffer it if: we're already mid-command, the first real byte is
-				// `!` (skipping leading escapes/whitespace and bracketed-paste
-				// markers), or — only at line start — the read so far is nothing but
-				// whitespace (a `!` command may follow).
-				if len(pendingLine) > 0 || isBangStart(data) || bytes.HasPrefix(data, []byte("\x1b[200~")) || (atLineStart && isLeadingSpace(data)) {
+				// Decide whether this read is (the start of) a local transfer command.
+				// Buffer it if: we're already mid-command, the first real byte is `!`, the
+				// read is wrapped in bracketed-paste markers, or the text could still grow
+				// into a tp command ("get@! …" starts with an ordinary letter, so it needs
+				// this gate rather than a first-byte test).
+				// An escape sequence on its own (arrow keys, Ctrl+R, ...) is an
+				// immediate action for the remote's readline, never the start of a
+				// command. Buffering it — which the empty text it leaves behind would
+				// otherwise do, since "" prefixes every command — is what makes history
+				// recall run invisibly: the recall happens, but the redraw is held.
+				if len(pendingLine) > 0 || isBangStart(data) ||
+					bytes.HasPrefix(data, []byte("\x1b[200~")) ||
+					(!onlyEscapes(data) && couldBeTpCommand(string(data))) {
 					// A `!` command — typed directly, indented, or wrapped in
 					// bracketed-paste markers. It never reaches the remote, so we echo it
 					// ourselves AND buffer it with basic line editing (backspace, Ctrl+U
@@ -586,6 +588,24 @@ func cmdSSH(args []string) int {
 							i++
 						}
 					}
+
+					// The line may have diverged ("git status"): it was ordinary typing
+					// after all. Those bytes are already on screen from the echo above, so
+					// hand them to the remote without echoing twice, and register them as
+					// expected echo so the remote's copy is not printed a second time.
+					if len(pendingLine) > 0 && bytes.IndexByte(pendingLine, '\n') < 0 &&
+						!couldBeTpCommand(string(pendingLine)) {
+						dbg("pendingLine released: %q", pendingLine)
+						for _, b := range pendingLine {
+							if b >= 0x20 && b != 0x7f {
+								echoedCols++
+							}
+						}
+						echoSup.push(pendingLine)
+						f.Write(pendingLine)
+						pendingLine = nil
+						continue
+					}
 				} else {
 					// Normal input: local echo (always on) + forward. The remote may
 					// also echo; echoSup drops the duplicate in the output reader.
@@ -613,7 +633,6 @@ func cmdSSH(args []string) int {
 					echoInput(data, true, &echoedCols)
 					echoSup.push(data)
 					f.Write(data)
-					atLineStart = data[len(data)-1] == '\n'
 					continue
 				}
 
@@ -629,24 +648,17 @@ func cmdSSH(args []string) int {
 					// Strip ANSI escape sequences (incl. bracketed-paste markers
 					// \x1b[200~ / \x1b[201~) to get the real command text.
 					clean := strings.TrimSpace(string(stripANSI(line)))
-					// "!!get" / "!!put" is the escape hatch: the user means the literal
-					// shell word (a remote alias of that name, a line inside a heredoc),
-					// not tp's command. Drop one "!" and let the remote have it. A bare
-					// "!!" or "!!vim" still falls through untouched as bash history
-					// expansion.
-					if strings.HasPrefix(clean, "!!get") || strings.HasPrefix(clean, "!!put") {
-						if i := bytes.Index(line, []byte("!!")); i >= 0 {
-							line = append(append([]byte{}, line[:i+1]...), line[i+2:]...)
-						}
-						echoSup.push(stripANSI(line))
-						f.Write(line)
-						continue
+					// Recognised by its first word, so `get@! f` is a download while
+					// `get@!x` or a heredoc line that merely starts with `get` is not.
+					action := ""
+					if parts := strings.Fields(clean); len(parts) > 0 {
+						action = tpAction(parts[0])
 					}
-					if strings.HasPrefix(clean, "!get") || strings.HasPrefix(clean, "!put") {
+					if action != "" {
 						parts := strings.Fields(clean)
 						// logMode -1 = "-l not given"; resolved per-action below where the default is
 						// logging-on so an interrupted transfer can resume.
-						lc := localCmd{action: parts[0][1:], logMode: -1}
+						lc := localCmd{action: action, logMode: -1}
 						if len(parts) >= 2 {
 							lc.arg1 = parts[1]
 						}
@@ -679,7 +691,6 @@ func cmdSSH(args []string) int {
 						f.Write(line)
 					}
 				}
-				atLineStart = len(pendingLine) == 0
 			}
 			if rerr != nil {
 				return

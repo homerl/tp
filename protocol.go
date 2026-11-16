@@ -425,7 +425,65 @@ func splitMarker(m string) string {
 // re-downloads the file. Where HISTCONTROL is unset this is just a harmless
 // leading space. It must NOT be used on !put base64 data lines: those are read
 // by `head`/`base64 -d`, not by the shell.
+// onlyEscapes reports whether b is nothing but escape sequences (and other
+// non-printing bytes) with at least one escape in it: an arrow key, a Ctrl+R, a
+// function key. Those are readline actions for the remote and must be forwarded
+// the instant they arrive.
+func onlyEscapes(b []byte) bool {
+	return bytes.Contains(b, []byte{0x1b}) && len(bytes.TrimSpace(stripANSI(b))) == 0
+}
+
 const leadSpace = " "
+
+// tpCommands are the in-session transfer commands.
+//
+// The bang trails the word ("get@! /path") on purpose. bash only performs
+// history expansion on a "!" followed by something other than a space, tab or
+// newline, so a trailing bang is inert: the line can never be swallowed by
+// history expansion, which is what made the leading-bang spellings awkward to
+// type on a live shell (a forwarded "!get" comes back as "bash: !get: event not
+// found"). "!get"/"!put" are still accepted for muscle memory and existing docs.
+var tpCommands = []string{"get@!", "put@!", "!get", "!put"}
+
+// tpAction maps a typed first word to the transfer to run, or "" when the word
+// is not a tp command. The legacy "!get"/"!put" match as prefixes, as they
+// always have; the trailing-bang spellings must match exactly, so a word like
+// "get@1x" stays an ordinary argument.
+func tpAction(word string) string {
+	switch word {
+	case "get@!", "put@!":
+		return word[:3]
+	}
+	switch {
+	case strings.HasPrefix(word, "!get"):
+		return "get"
+	case strings.HasPrefix(word, "!put"):
+		return "put"
+	}
+	return ""
+}
+
+// couldBeTpCommand reports whether text typed so far could still grow into a tp
+// command. It gates buffering: "g" is ambiguous ("get@! /f" versus "git status"),
+// so the line is held only until it diverges — "git" is released to the remote on
+// the third keystroke, and ordinary typing keeps its readline, Tab completion and
+// Ctrl+R. Without this gate, catching "get@!" would mean holding every line that
+// starts with g or p for its whole length.
+func couldBeTpCommand(text string) bool {
+	text = strings.TrimLeft(string(stripANSI([]byte(text))), " \t")
+	for _, c := range tpCommands {
+		if len(text) <= len(c) {
+			if strings.HasPrefix(c, text) {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(text, c) {
+			return true
+		}
+	}
+	return false
+}
 
 // echoNonce tags each injected remote command with a random token (appended as
 // a shell comment) so the output reader can recognize and drop the remote's

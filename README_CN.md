@@ -2,7 +2,7 @@
 
 > 多跳板机反复传输多份日志实在让人崩溃
 
-在 `ssh` 包一层，在会话里用 `!get` / `!put` 传文件，自动校验、断点续传。
+在 `ssh` 包一层，在会话里用 `get@!` / `put@!` 传文件，自动校验、断点续传。
 
 ### 这个项目最大的特点
 
@@ -48,8 +48,8 @@ tp version
 在 `tp ssh` 的终端里直接输入：
 
 ```
-!get <remote_path> [local_name] [-l 0|1] [-f <log_file>]
-!put <local_path> [remote_path] [-l 0|1] [-f <log_file>]
+get@! <remote_path> [local_name] [-l 0|1] [-f <log_file>]
+put@! <local_path> [remote_path] [-l 0|1] [-f <log_file>]
 ```
 
 | 参数 | 说明 |
@@ -58,7 +58,7 @@ tp version
 | `-l 0` | 关闭，纯传不记录 |
 | `-f <file>` | 自定义日志文件路径（默认会自动获取断点日志 `<目标文件名>.tprlog`） |
 
-想告诉 tp“这行是给 shell 的，不是给你的”，就把感叹号写两个：`!!get foo bar` 会原样去掉一个 `!` 转发给远端。heredoc 或续行里偶然出现以 `!get` 开头的行、或者远端自己有个同名命令时用得上。（光写 `!!` 不受影响，仍然是 bash 的历史展开。）
+`!get` / `!put` 也照旧能用。主写法把感叹号放到词尾，是因为 bash 只对后面跟着非空格/制表/换行的 `!` 做历史展开：行首的 `!get` 可能被 bash 拦下来报 `bash: !get: event not found`，而词尾的 `!` 是惰性的，一定能送到 tp 手里。命令按整词匹配，所以 `get@!x` 或者只是以 `get` 开头的行会交给 shell。
 
 ### 慢链路 / 堡垒机
 
@@ -79,18 +79,18 @@ $ tp ssh jump1 -p 2222          # 代替 ssh jump1 -p 2222
 # ... 手动跳转到目标机器 ...
 
 # 下载
-!get /tmp/bigfile.bin
+get@! /tmp/bigfile.bin
 [tp] ↓ 1.2 GB → ./bigfile.bin (resumable)
 [tp] ✓ ./bigfile.bin (1.2 GB) 42.3s 29.15 MB/s avg
 
 # 上传
-!put ./local.txt /tmp/remote.txt
+put@! ./local.txt /tmp/remote.txt
 [tp] ↑ ./local.txt (3.4 MB) → /tmp/remote.txt
 [tp] ✓ /tmp/remote.txt uploaded OK
 
 ```
 
-中断（Ctrl+C 或网络断了）后重新执行同一条 `!get` / `!put`，会从断点继续：
+中断（Ctrl+C 或网络断了）后重新执行同一条 `get@!` / `put@!`，会从断点继续：
 
 ```
 [tp] ↻ /tmp/bigfile.bin → ./bigfile.bin (resume from block 87)
@@ -137,7 +137,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 │                                              │
 │  stdin reader ──→ 本地 echo + 转发           │
 │       │                                      │
-│       ├── 识别 !get / !put 命令              │
+│       ├── 识别 get@! / put@! 命令              │
 │       │                                      │
 │       ▼                                      │
 │  PTY (tp ↔ ssh)                              │
@@ -158,7 +158,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 └──────────────────────────────────────────────┘
 ```
 
-### 下载 (!get) 流程
+### 下载 (get@!) 流程
 
 1. tp 往 SSH 通道注入一条 shell 命令，远端用 `dd` 按 4 MiB 分块读文件
 2. 每块先发一个 `__TP_BLOCK__ <序号> <校验和>` 标记，再发该块的 base64
@@ -167,7 +167,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 5. 全部完成后 `__TP_DONE__` 触发：rename 临时文件到目标，删除日志
 6. 任何一步失败：删除临时文件，保留日志（供续传），原文件不受影响
 
-### 上传 (!put) 流程
+### 上传 (put@!) 流程
 
 1. tp 先探测远端目标是否存在（`__TP_EXISTS__`），存在则弹 y/N
 2. 注入 `head -n N | base64 -d > tmp` 命令

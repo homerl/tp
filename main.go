@@ -35,20 +35,22 @@ Usage:
   tp version
 
 In-session commands (type these in the tp ssh terminal):
-  !get <remote_path> [local_name]    Download a remote file
-  !put <local_path> [remote_path]    Upload a local file
+  get@! <remote_path> [local_name]   Download a remote file
+  put@! <local_path> [remote_path]   Upload a local file
 
 Workflow:
   $ tp ssh jump1              # instead of 'ssh jump1'
   # ... manually navigate to the target machine however you normally do ...
   # Now on the target machine:
 
-  !get /tmp/bigfile.bin              # download
-  !put ./local.txt /tmp/remote.txt   # upload
+  get@! /tmp/bigfile.bin             # download
+  put@! ./local.txt /tmp/remote.txt  # upload
 
 Both directions verify sha256 automatically.
 The local 'tp ssh' silently intercepts data - you only see progress bars.
-Write '!!get' / '!!put' to send such a line to the shell instead of tp.
+'!get' / '!put' are accepted too. The bang trails the word because bash only
+history-expands a '!' followed by a non-space: a trailing bang can never be
+mistaken for history expansion, so the line always reaches tp.
 
 Slow links (some bastions pace pasted input): tp reports how much is still
 queued and waits for the remote instead of failing early. Tunables:

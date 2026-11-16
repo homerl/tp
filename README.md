@@ -4,7 +4,7 @@
 
 > 中文版 / Chinese version: [README_CN.md](README_CN.md)
 
-Wrap `ssh`, and inside the session use `!get` / `!put` to transfer files, with automatic checksums and resumable transfers.
+Wrap `ssh`, and inside the session use `get@!` / `put@!` to transfer files, with automatic checksums and resumable transfers.
 
 ### The best thing about this project
 
@@ -49,8 +49,8 @@ tp version
 Type directly in the `tp ssh` terminal:
 
 ```
-!get <remote_path> [local_name] [-l 0|1] [-f <log_file>]
-!put <local_path> [remote_path] [-l 0|1] [-f <log_file>]
+get@! <remote_path> [local_name] [-l 0|1] [-f <log_file>]
+put@! <local_path> [remote_path] [-l 0|1] [-f <log_file>]
 ```
 
 | Parameter | Description |
@@ -59,11 +59,12 @@ Type directly in the `tp ssh` terminal:
 | `-l 0` | Disable, transfer without recording |
 | `-f <file>` | Custom log file path (by default it auto-detects the resume log `<target filename>.tprlog`) |
 
-Double the bang to mean "this is for the shell, not for tp": `!!get foo bar` is
-forwarded to the remote as `!get foo bar`. Use it when a line inside a heredoc or
-a continuation happens to start with `!get`, or when the remote has its own
-command by that name. (A bare `!!` is untouched and stays bash history
-expansion.)
+`!get` / `!put` work as well, for muscle memory. The bang trails the word in the
+primary spelling because bash performs history expansion on a `!` followed by
+anything but a space, tab or newline — a leading `!get` could come back as
+`bash: !get: event not found`, while a trailing bang is inert and always reaches
+tp. Commands are matched as whole words, so `get@!x` or a line that merely starts
+with `get` goes to the shell.
 
 ### Slow links and bastions
 
@@ -90,18 +91,18 @@ $ tp ssh jump1 -p 2222          # replaces 'ssh jump1 -p 2222'
 # ... manually jump to the target machine ...
 
 # Download
-!get /tmp/bigfile.bin
+get@! /tmp/bigfile.bin
 [tp] ↓ 1.2 GB → ./bigfile.bin (resumable)
 [tp] ✓ ./bigfile.bin (1.2 GB) 42.3s 29.15 MB/s avg
 
 # Upload
-!put ./local.txt /tmp/remote.txt
+put@! ./local.txt /tmp/remote.txt
 [tp] ↑ ./local.txt (3.4 MB) → /tmp/remote.txt
 [tp] ✓ /tmp/remote.txt uploaded OK
 
 ```
 
-After an interruption (Ctrl+C or network drop), re-run the same `!get` / `!put` and it resumes from where it stopped:
+After an interruption (Ctrl+C or network drop), re-run the same `get@!` / `put@!` and it resumes from where it stopped:
 
 ```
 [tp] ↻ /tmp/bigfile.bin → ./bigfile.bin (resume from block 87)
@@ -154,7 +155,7 @@ Your keyboard
 │                                              │
 │  stdin reader ──→ local echo + forward        │
 │       │                                       │
-│       ├── recognizes !get / !put commands     │
+│       ├── recognizes get@! / put@! commands     │
 │       │                                       │
 │       ▼                                       │
 │  PTY (tp ↔ ssh)                               │
@@ -175,7 +176,7 @@ Your keyboard
 └──────────────────────────────────────────────┘
 ```
 
-### Download (!get) flow
+### Download (get@!) flow
 
 1. tp injects a shell command into the SSH channel; the remote reads the file in 4 MiB chunks with `dd`
 2. Each chunk first sends a `__TP_BLOCK__ <n> <cksum>` tag, then the base64 of that chunk
@@ -184,7 +185,7 @@ Your keyboard
 5. On completion, `__TP_DONE__` triggers: rename the temp file to the target, delete the log
 6. On any failure: delete the temp file, keep the log (for resuming), leave the original file untouched
 
-### Upload (!put) flow
+### Upload (put@!) flow
 
 1. tp first probes whether the remote target exists (`__TP_EXISTS__`); if it does, it prompts y/N
 2. Inject `head -n N | base64 -d > tmp`
@@ -235,8 +236,8 @@ main.go         entrypoint, command dispatch
 session.go      tp ssh main session: PTY management, goroutine orchestration, !command parsing
 tty.go          local terminal handling: echo, echoSuppressor, ANSI parsing
 protocol.go     protocol tag parsing, remote probing, nonce
-download.go     !get implementation: chunked download, stream base64 decode, resumption
-upload.go       !put implementation: chunked upload, progress, checksums
+download.go     get@! implementation: chunked download, stream base64 decode, resumption
+upload.go       put@! implementation: chunked upload, progress, checksums
 resume.go       .tprlog log parsing
 util.go          utility functions (humanSize, progressTicker, etc.)
 e2e_test.go     end-to-end tests (simulates full PTY link)
@@ -250,7 +251,7 @@ go test ./...
 ```
 
 Test coverage:
-- Full `!get` / `!put` flow (simulated PTY + base64 stream)
+- Full `get@!` / `put@!` flow (simulated PTY + base64 stream)
 - Resumption (recovery after interruption)
 - Checksum failure handling
 - Overlap confirmation
