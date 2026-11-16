@@ -173,6 +173,16 @@ Your keyboard
 
 tp sets the local terminal to raw mode and does its own echo (`echoInput`), while a queue called `echoSuppressor` matches and swallows the duplicate characters from the remote echo. Whether the remote has ECHO or OPOST on or off, only one copy is displayed.
 
+### Why tp's commands stay out of your shell history
+
+tp runs a transfer by injecting one long shell command into your session. Every
+injected command starts with a space, so a remote whose bash sets
+`HISTCONTROL=ignorespace` or `ignoreboth` (Debian and Ubuntu ship that) never
+records it — ↑ keeps recalling your own commands instead of a 1200-character
+one-liner that would re-transfer the file if you ran it. On a remote without
+that setting the space is simply ignored and tp's command does land in the
+history; nothing breaks, it is just noisier to scroll back through.
+
 ### Resumption mechanism
 
 - Log file `.tprlog`: first line is `<filename> <total blocks>`, then each subsequent line is `<block number> <checksum>`

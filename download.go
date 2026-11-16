@@ -370,7 +370,7 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 	// accepted. The local detects the algorithm by checksum length
 	// (8 = crc32/cksum, 16 = xxh64, 64 = sha256). The temp block file is
 	// written to /tmp if writable, otherwise to the current directory.
-	inject := fmt.Sprintf(
+	inject := leadSpace + fmt.Sprintf(
 		"if [ -f %s ]; then TPDIR=/tmp;[ -w /tmp ]||TPDIR=.; SZ=$(stat -c%%s %s 2>/dev/null || stat -f%%z %s 2>/dev/null); T=$(( (SZ + %d) / %d )); if command -v xxh64sum >/dev/null 2>&1; then H=xxh64sum;A='{print $1}'; elif command -v sha256sum >/dev/null 2>&1; then H=sha256sum;A='{print $1}'; elif command -v shasum >/dev/null 2>&1; then H=\"shasum -a 256\";A='{print $1}'; elif command -v sha256 >/dev/null 2>&1; then H=sha256;A='{print $1}'; elif command -v cksum >/dev/null 2>&1; then H=cksum;A='{printf \"%%08x\",$1}'; else echo \"%s no hash tool on remote (need xxh64sum/sha256sum/shasum/sha256/cksum)\"; fi; if [ -n \"$H\" ]; then echo \"%s|%s|$SZ|$T\"; N=%d; while [ $N -lt $T ]; do dd if=%s bs=%d skip=$N count=1 2>/dev/null > $TPDIR/.tpblk.$$; [ -s $TPDIR/.tpblk.$$ ] || break; S=$($H $TPDIR/.tpblk.$$ 2>/dev/null | awk \"$A\"); echo \"%s $N $S\"; base64 -w 32000 $TPDIR/.tpblk.$$ 2>/dev/null || base64 $TPDIR/.tpblk.$$; N=$((N+1)); done; rm -f $TPDIR/.tpblk.$$; echo %s; fi; else echo \"%s no such file: %s\"; fi #%s\n",
 		qRemote, qRemote, qRemote, tpBlockSize-1, tpBlockSize, splitMarker(TPError), splitMarker(TPBegin), localPath, resumeFrom, qRemote, tpBlockSize, splitMarker(TPBlock), splitMarker(TPDone), splitMarker(TPError), remotePath, nonce)
 	if len(inject) > 4095 {

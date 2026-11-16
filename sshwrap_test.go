@@ -1068,3 +1068,35 @@ func TestSplitNonceTag(t *testing.T) {
 		t.Fatalf("empty input: %v/%q", rest, tag)
 	}
 }
+
+// TestInjectedCommandsLeadWithSpace pins the "stay out of the remote's history"
+// rule: every command tp injects starts with a space, so a remote whose bash has
+// HISTCONTROL=ignorespace/ignoreboth (Debian and Ubuntu ship that) never records
+// it. Otherwise the user's ↑ key recalls tp's 1200-character one-liner instead of
+// their own commands, and running it re-transfers the file.
+func TestInjectedCommandsLeadWithSpace(t *testing.T) {
+	q, ok := dq("/tmp/f")
+	if !ok {
+		t.Fatal("dq rejected a plain path")
+	}
+	qTmp, _ := dq("/tmp/f.tpTMP")
+	cmdLine, _ := putCmdLine(q, qTmp, 100, 100, false, "nn")
+	cases := map[string]string{
+		"exists":  existsProbe(q, "nn"),
+		"tmpsize": tmpSizeProbe(qTmp, "nn"),
+		"cksum":   cksumProbe(q, []int{0, 1}, "nn"),
+		"trunc":   truncateCmd(qTmp, 40, "nn"),
+		"put":     cmdLine,
+	}
+	for name, cmd := range cases {
+		if !strings.HasPrefix(cmd, leadSpace) {
+			t.Errorf("%s command does not start with the history-dodging space: %q", name, cmd[:min(20, len(cmd))])
+		}
+	}
+	// The data lines of a !put are consumed by head/base64, not the shell: a
+	// leading space there would corrupt the stream.
+	dataLine := append(append([]byte{}, bytes.Repeat([]byte("A"), 3000)...), '\n')
+	if bytes.HasPrefix(dataLine, []byte(leadSpace)) {
+		t.Error("base64 data lines must not be space-prefixed")
+	}
+}

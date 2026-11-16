@@ -417,6 +417,16 @@ func splitMarker(m string) string {
 	return m
 }
 
+// leadSpace is prefixed to every command tp injects into the remote shell. On
+// the many systems whose bash sets HISTCONTROL=ignorespace or ignoreboth
+// (Debian and Ubuntu do it in /etc/bash.bashrc), a leading space keeps the line
+// out of the history. Without it, pressing ↑ after a transfer recalls tp's
+// 1200-character one-liner instead of the user's own commands — and running it
+// re-downloads the file. Where HISTCONTROL is unset this is just a harmless
+// leading space. It must NOT be used on !put base64 data lines: those are read
+// by `head`/`base64 -d`, not by the shell.
+const leadSpace = " "
+
 // echoNonce tags each injected remote command with a random token (appended as
 // a shell comment) so the output reader can recognize and drop the remote's
 // echo of that command — otherwise the raw (long, ugly) command would print to
@@ -453,7 +463,7 @@ func currentEchoNonce() string {
 // "__TP_EXISTS__ #<nonce> yes|no". The quoted nonce tag rides back in the answer
 // so a reply to an already-abandoned probe is recognisable and dropped.
 func existsProbe(qTarget, nonce string) string {
-	return fmt.Sprintf("[ -e %s ] && echo %s \"#%s\" yes || echo %s \"#%s\" no\n",
+	return leadSpace + fmt.Sprintf("[ -e %s ] && echo %s \"#%s\" yes || echo %s \"#%s\" no\n",
 		qTarget, splitMarker(TPExists), nonce, splitMarker(TPExists), nonce)
 }
 
@@ -461,7 +471,7 @@ func existsProbe(qTarget, nonce string) string {
 // as "__TP_TMP_SIZE__ #<nonce> <n>" (0 if missing). !put resume uses it to check
 // the remote's partial file matches the blocks already sent.
 func tmpSizeProbe(qTmp, nonce string) string {
-	return fmt.Sprintf("echo %s \"#%s\" $(wc -c < %s 2>/dev/null || echo 0)\n",
+	return leadSpace + fmt.Sprintf("echo %s \"#%s\" $(wc -c < %s 2>/dev/null || echo 0)\n",
 		splitMarker(TPTmpSize), nonce, qTmp)
 }
 
@@ -474,7 +484,7 @@ func cksumProbe(qTmp string, blocks []int, nonce string) string {
 	for i, b := range blocks {
 		list[i] = strconv.Itoa(b)
 	}
-	return fmt.Sprintf(
+	return leadSpace + fmt.Sprintf(
 		"echo %s \"#%s\" $(for i in %s; do dd if=%s bs=4M skip=$i count=1 2>/dev/null | xxh64sum 2>/dev/null | awk '{print $1}'; done | tr '\\n' ' ')\n",
 		splitMarker(TPCksum), nonce, strings.Join(list, " "), qTmp)
 }
@@ -484,7 +494,7 @@ func cksumProbe(qTmp string, blocks []int, nonce string) string {
 // metadata-only) `truncate` and falls back to a copy on BSD/macOS.
 func truncateCmd(qTmp string, nBlocks int64, nonce string) string {
 	size := nBlocks * int64(tpBlockSize)
-	return fmt.Sprintf("truncate -s %d %s 2>/dev/null || { head -c %d %s > %s.trunc && mv -f %s.trunc %s; } #%s\n",
+	return leadSpace + fmt.Sprintf("truncate -s %d %s 2>/dev/null || { head -c %d %s > %s.trunc && mv -f %s.trunc %s; } #%s\n",
 		size, qTmp, size, qTmp, qTmp, qTmp, qTmp, nonce)
 }
 

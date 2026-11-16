@@ -166,6 +166,10 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 
 tp 把本地终端设为 raw mode，自己做 echo（`echoInput`），同时用一个 `echoSuppressor` 队列匹配并吞掉远端回显的重复字符。不管远端 ECHO 开没开、OPOST 开没开，显示都只有一份。
 
+### 为什么 tp 的命令不会进你的 shell 历史
+
+tp 传文件是靠往你的会话里注入一条很长的 shell 命令。每条注入的命令前面都带一个空格，所以只要远端 bash 设了 `HISTCONTROL=ignorespace` 或 `ignoreboth`（Debian、Ubuntu 默认就设），这条就不会进 history——按 ↑ 召回的还是你自己的命令，而不是那条 1200 字符、一按回车就重传一遍的一行命令。远端没设这个的话，空格被忽略，tp 的命令会进 history，不影响正确性，只是翻历史时吵一点。
+
 ### 断点续传机制
 
 - 日志文件 `.tprlog`：首行是 `<文件名> <总块数>`，之后每行 `<块号> <校验和>`

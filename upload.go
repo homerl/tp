@@ -42,7 +42,7 @@ func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool, non
 	if resume {
 		redirect = ">>"
 	}
-	line := fmt.Sprintf(
+	line := leadSpace + fmt.Sprintf(
 		"head -n %d | base64 -d %s %s 2>/dev/null; [ \"$(wc -c < %s 2>/dev/null)\" = \"%d\" ] && mv -f %s %s; rm -f %s; echo %s \"#%s\" $(sha256sum %s 2>/dev/null | awk '{print $1}')\n",
 		n, redirect, qTmp, qTmp, fileSize, qTmp, qTarget, qTmp, splitMarker(TPDone), nonce, qTarget)
 	return line, n
@@ -361,7 +361,7 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	// ICRNL turns \r into \n, so \r\n would inject a stray empty line that
 	// head -n N would count as data.
 	if !resume {
-		injectCh <- []byte(fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce))
+		injectCh <- []byte(leadSpace + fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce))
 		time.Sleep(300 * time.Millisecond)
 	}
 	injectCh <- []byte(cmdLine)
@@ -522,7 +522,7 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		// the temp files (this line queues behind anything still pending).
 		injectBestEffort(injectCh, []byte{3})
 		injectBestEffort(injectCh, []byte("\n"))
-		injectBestEffort(injectCh, []byte(fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce)))
+		injectBestEffort(injectCh, []byte(leadSpace+fmt.Sprintf("rm -f %s 2>/dev/null #%s\n", qTmp, nonce)))
 		fmt.Fprintf(os.Stderr, "\033[1;33m[tp] ⚠ verification timed out; terminal reset, check %s manually\033[0m\n", remotePath)
 	}
 
