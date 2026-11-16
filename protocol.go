@@ -365,14 +365,32 @@ func handleLine(line []byte, cap *captureState) {
 	os.Stdout.Write(line)
 }
 
-// mightBeMarker reports whether a partial line (no newline yet) could
-// contain a TP marker. Any line containing "__TP_" is held until its
-// newline arrives, so a marker split across two reads can never be
-// forwarded early and destroyed. Base64 data lines can never contain
-// underscores, and normal shell output essentially never contains our
-// private marker prefix, so holding such lines briefly is harmless.
+// maxMarkerLen is one longer than the longest marker ("__TP_TMP_SIZE__"). A
+// partial line only needs holding while a "__TP_" near its end could still grow
+// into a marker; past that the bytes following it have already ruled every
+// marker out.
+const maxMarkerLen = 16
+
+// mightBeMarker reports whether a partial line (no newline yet) still has to be
+// held back from the screen because it could be a protocol marker. Two cases
+// need holding: it already contains a complete marker (a response line that
+// arrived cut in half — flushing it would both print raw protocol and lose the
+// answer), or its tail holds a "__TP_" close enough to the end to still become
+// one (a marker split across two reads).
+//
+// It deliberately does NOT hold any line that merely contains "__TP_" somewhere
+// in the middle. The shell echoing one of our injected commands, or readline
+// redrawing such a line out of history, contains plenty of __TP_ prefixes (the
+// split form, __TP_""DONE__, which is never a real marker) and readline redraws
+// carry no newline at all — holding those meant the recalled line sat in the
+// buffer invisible until the next newline arrived, which is exactly what made
+// arrow-key history recall look dead and buried the overwrite prompt under it.
 func mightBeMarker(lineBuf []byte) bool {
-	return bytes.Contains(lineBuf, []byte("__TP_"))
+	if hasFullMarker(string(lineBuf)) {
+		return true
+	}
+	i := bytes.LastIndex(lineBuf, []byte("__TP_"))
+	return i >= 0 && len(lineBuf)-i < maxMarkerLen
 }
 
 // dq double-quotes a path for safe use inside a remote shell command.

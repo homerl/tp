@@ -155,6 +155,25 @@ func TestMightBeMarker(t *testing.T) {
 			t.Errorf("mightBeMarker(%q) = true, want false", s)
 		}
 	}
+
+	// A long line carrying only SPLIT markers (the shell echoing an injected
+	// command, or readline redrawing one from history) must NOT be held: readline
+	// redraws never end in a newline, so holding it makes the line invisible.
+	echo := `if [ -f "/tmp/x" ]; then echo "__TP_""BEGIN__|f|1|1"; echo "__TP_""BLOCK__ $N $S"; echo __TP_""DONE__; fi #deadbeefcafe1234`
+	if mightBeMarker([]byte(echo)) {
+		t.Error("an echoed injected command must be displayed, not held for a newline that never comes")
+	}
+	// A response line that arrives cut in half must still be held even when the
+	// marker sits far from the end, or the answer would be lost.
+	for _, s := range []string{TPCksum + " #abc c1 c2 c3 c4 c5 c6 c7", TPBegin + "|a-very-long-local-file-name.bin|12345678|3"} {
+		if !mightBeMarker([]byte(s)) {
+			t.Errorf("half-arrived response %q must be held", s)
+		}
+	}
+	// A "__TP_" too far from the end to still become a marker is plain text.
+	if mightBeMarker([]byte("grep -r __TP_ somefile.txt and more output here")) {
+		t.Error("a __TP_ with a full marker's worth of text after it cannot be a marker")
+	}
 }
 
 // TestHandleLineGarbagePrefixedMarkers reproduces the user's environment:
