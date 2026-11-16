@@ -79,6 +79,7 @@ cannot trust — tp has then simply not seen the confirmation yet).
 | Variable | Default | Meaning |
 |------|------|------|
 | `TP_LINK_STALL` | `60` | seconds with zero write progress before the link is called dead |
+| `TP_QUIET_NOTE` | `10` | seconds of silence before tp says it is still waiting (`0` = never) |
 | `TP_VERIFY_TIMEOUT` | `30` + 2s per 4 MiB | first wait for the remote's checksum |
 | `TP_VERIFY_CAP` | `600` | absolute limit on that wait |
 | `TP_DEBUG` | off | trace the protocol to stderr |
@@ -155,6 +156,28 @@ What you can do about it, biggest lever first:
    Bytes that never enter the pty are never metered.
 4. In `screen`, `defbce on` shrinks redraws. Do not reach for `defflow`: XON/XOFF
    through a chain of proxies tends to lock the session instead.
+
+### Downloading never goes silent
+
+Nothing times out on the download path — a get ends when `__TP_DONE__` arrives,
+and its progress bar only moves when bytes arrive. On a link that drips, the
+screen therefore just stops moving while everything is fine, which looks exactly
+like a crashed program (and was reported as one). So while a get is in flight a
+watchdog keeps saying what tp is waiting for, after 10s of silence and then at
+25s, 1m, 2m and 5m:
+
+```
+[tp] … still waiting for the remote to answer: 12s of silence, nothing received yet
+[tp] … still waiting for ./big.bin: 25s of silence, 4.20 MB/100.00 MB received
+[tp] … still waiting for ./big.bin: 25s of silence, 4.20 MB/100.00 MB received, tp is still pushing 1.2 KB
+```
+
+The last line is the useful one: bytes still queued on tp's side mean the link is
+pacing *input*, while silence with an empty queue means the remote (or something
+rendering for it) is the one holding the data. Bytes moving resets the ladder, so
+a transfer that is merely slow stays quiet; one that is truly stuck gets the last
+note, which names the two explanations that look identical from the chair and then
+stops talking. `TP_QUIET_NOTE=30` moves the whole ladder; `0` silences it.
 
 ### Typical workflow
 

@@ -236,6 +236,7 @@ func handleLine(line []byte, cap *captureState) {
 	if idx := strings.Index(trimmed, TPError); idx >= 0 {
 		msg := strings.TrimSpace(trimmed[idx+len(TPError):])
 		dbg("%s from remote: %s", TPError, msg)
+		dlWatchStop() // the remote has said its piece; nothing more is coming
 		errf("%s", msg)
 		return
 	}
@@ -265,6 +266,7 @@ func handleLine(line []byte, cap *captureState) {
 		cap.blocksize = tpBlockSize
 		cap.tmpName = name + ".tptmp"
 		dbg("%s: name=%q size=%d blocks=%d", TPBegin, name, cap.totalSize, cap.totalBlocks)
+		dlWatchBegin(name, cap.totalSize) // the quiet watchdog can now be specific
 
 		// Read the logging/resume config (set by doNoRemoteGet before inject).
 		getLog.mu.Lock()

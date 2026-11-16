@@ -67,6 +67,7 @@ put@! <local_path> [remote_path] [-l 0|1] [-f <log_file>]
 | 变量 | 默认 | 含义 |
 |------|------|------|
 | `TP_LINK_STALL` | `60` | 写入完全没进展多少秒后判定链路已死 |
+| `TP_QUIET_NOTE` | `10` | 静默多少秒后 tp 主动告诉你它还在等（`0` = 不说） |
 | `TP_VERIFY_TIMEOUT` | `30` + 每 4 MiB 加 2s | 等远端 checksum 的第一轮时长 |
 | `TP_VERIFY_CAP` | `600` | 这个等待的绝对上限 |
 | `TP_DEBUG` | 关 | 协议轨迹输出到 stderr |
@@ -110,6 +111,18 @@ time (for i in $(seq 30); do echo x > /dev/tty; done)
 2. 把窗口拉宽（字号调小，300~400 列）。多路复用器按窗口宽度折行，列数 ×4 就是要画的行 ÷ 4。tp 会把你真实的窗口尺寸告诉远端，所以这个能一路穿透。
 3. 大输出别进 tty：`cmd > /tmp/x 2>&1` 再 `less /tmp/x`。没进 pty 的字节不收费。
 4. screen 里可以 `defbce on`，重绘时少发字节。别去碰 `defflow`：XON/XOFF 穿过一整个代理链，锁死的概率比提速的概率大。
+
+### 下载不会闷着不出声
+
+下载这条路上没有任何超时——get 等到 `__TP_DONE__` 才算完，而进度条只有字节到了才动。所以在会滴水的链路上，屏幕就是停在那里不动，而其实一切正常——看起来跟程序挂掉一模一样（也确实被当成挂掉报过）。所以现在 get 进行中时，有个看门狗会开口说话：静默 10 秒开始，然后 25 秒、1 分钟、2 分钟、5 分钟：
+
+```
+[tp] … still waiting for the remote to answer: 12s of silence, nothing received yet
+[tp] … still waiting for ./big.bin: 25s of silence, 4.20 MB/100.00 MB received
+[tp] … still waiting for ./big.bin: 25s of silence, 4.20 MB/100.00 MB received, tp is still pushing 1.2 KB
+```
+
+最后那行最有用：tp 自己还积压着字节，说明链路在限**输入**；队列空着而依旧静默，那就是远端（或者替远端渲染的那个东西）扣住了数据。字节一动，阶梯重置，所以只是慢的传输不会吵；真的卡住的会拿到最后一句，那句话把两种“坐在这把椅子上看起来一模一样”的解释都念出来，然后闭嘴。`TP_QUIET_NOTE=30` 把整个阶梯后移，`0` 关掉。
 
 ### 典型工作流
 

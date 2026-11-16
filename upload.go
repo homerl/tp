@@ -67,20 +67,6 @@ func isYesAnswer(s string) bool {
 // true only if the user explicitly answers y/yes; any other answer, a timeout,
 // or a cancel aborts. where is an optional location hint shown in the prompt
 // ("on remote" for !put); it's empty for local (!get) targets.
-// promptf writes an interactive question to the controlling terminal, falling
-// back to stderr. tp's own output is routinely redirected ("tp ssh host
-// 2>tp.log"), and a question that lands in a log file is indistinguishable from
-// a hang: the screen sits there while tp waits a full minute for an answer nobody
-// was ever shown. A question belongs on the screen whatever the redirections.
-func promptf(format string, args ...any) {
-	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
-		fmt.Fprintf(tty, format, args...)
-		tty.Close()
-		return
-	}
-	fmt.Fprintf(os.Stderr, format, args...)
-}
-
 func promptOverwrite(target, where string) bool {
 	loc := ""
 	if where != "" {
@@ -89,7 +75,7 @@ func promptOverwrite(target, where string) bool {
 	// Let the remote finish flushing (its PS1) so the prompt lands on a clean
 	// line instead of interleaving with the shell's prompt.
 	waitForQuiet(30*time.Millisecond, 300*time.Millisecond)
-	promptf("\n\033[1;33m[tp] ⚠ %s already exists%s. Overwrite? [y/N]\033[0m ", target, loc)
+	screenf("\n\033[1;33m[tp] ⚠ %s already exists%s. Overwrite? [y/N]\033[0m ", target, loc)
 	putGuard.mu.Lock()
 	answerCh := make(chan string, 1)
 	putGuard.answerCh = answerCh
@@ -104,11 +90,11 @@ func promptOverwrite(target, where string) bool {
 	putGuard.mu.Unlock()
 	if !ok {
 		errf("confirmation timed out; aborting, %s not modified", target)
-		promptf("\n\033[1;31m[tp] ✗ no answer after 60s; aborting, %s not modified\033[0m\n", target)
+		screenf("\n\033[1;31m[tp] ✗ no answer after 60s; aborting, %s not modified\033[0m\n", target)
 		return false
 	}
 	if !isYesAnswer(answer) {
-		promptf("\033[1;33m[tp] ⚠ aborted, %s not modified\033[0m\n", target)
+		screenf("\033[1;33m[tp] ⚠ aborted, %s not modified\033[0m\n", target)
 		return false
 	}
 	return true

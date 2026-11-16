@@ -30,6 +30,21 @@ func humanSize(n int64) string {
 	}
 }
 
+// screenf writes a message to the controlling terminal, falling back to stderr.
+// tp's own output is routinely redirected ("tp ssh host 2>tp.log"), and a message
+// that lands only in a log file is indistinguishable from a hang: the screen sits
+// there while tp waits — for an overwrite answer, or simply for bytes that are
+// crossing a slow bastion. Anything the user needs to see belongs on the screen
+// whatever the redirections.
+func screenf(format string, args ...any) {
+	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+		fmt.Fprintf(tty, format, args...)
+		tty.Close()
+		return
+	}
+	fmt.Fprintf(os.Stderr, format, args...)
+}
+
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "tp: "+format+"\n", args...)
 	os.Exit(1)

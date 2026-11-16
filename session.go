@@ -478,6 +478,7 @@ func cmdSSH(args []string) int {
 				if len(lineBuf) > 0 && atomic.LoadInt32(&suppress) == 0 {
 					os.Stdout.Write(ensureCRLF(lineBuf))
 				}
+				dlWatchStop() // the link is gone; a note about waiting would be a lie
 				if cap.file != nil {
 					// The link died (e.g. ssh disconnected) mid-download. Remove
 					// the partial temp file so the original target — if any — is

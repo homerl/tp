@@ -10,7 +10,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -150,6 +153,7 @@ func (c *captureState) feedB64(chars []byte) {
 		return
 	}
 	c.size += n
+	dlWatchProgress(c.size)
 }
 
 // finalizeBlock verifies the current block's sha256 against the remote's and
@@ -190,6 +194,7 @@ func (c *captureState) finish() {
 	if c.file == nil {
 		return
 	}
+	dlWatchStop() // whatever happens next, the wait is over
 	// Check for a truncated stream (residue that never formed a full group).
 	if c.b64err == nil {
 		if err := c.b64.finish(); err != nil {
@@ -282,6 +287,173 @@ func isB64Char(c byte) bool {
 		return true
 	}
 	return false
+}
+
+// --- the download's quiet watchdog -----------------------------------------
+//
+// Nothing times out on the download path: a get ends when __TP_DONE__ arrives,
+// and its progress bar only moves when bytes arrive. So on a link that drips —
+// a bastion that paces input, or one that renders every line it forwards before
+// sending it — the screen simply stops moving while everything is technically
+// fine. To the person sitting in front of it that is indistinguishable from a
+// crashed program, and it was reported as one. While a get is in flight tp now
+// keeps saying what it is waiting for and how much it has.
+var dlWatch struct {
+	sync.Mutex
+	quit  chan struct{} // non-nil while a get is in flight
+	name  string        // what was asked for (the remote path until __TP_BEGIN__)
+	got   int64         // payload bytes decoded so far
+	total int64         // payload bytes announced (0 = not known yet)
+	begun bool          // __TP_BEGIN__ has arrived
+}
+
+// quietNotesAt is how long a silence must last before each successive note. The
+// ladder escalates and the last rung is terminal: a transfer orphaned by a
+// Ctrl+C at the remote should stop nagging rather than print forever, while a
+// transfer that starts moving again gets its ladder reset and stays quiet.
+var quietNotesAt = []time.Duration{
+	10 * time.Second, 25 * time.Second, time.Minute, 2 * time.Minute, 5 * time.Minute,
+}
+
+// quietTick is how often the watchdog looks; a variable so tests do not wait seconds.
+var quietTick = time.Second
+
+// quietSink is where the notes go; a variable so tests can read them.
+var quietSink = func(note string) { screenf("%s", note) }
+
+func init() {
+	// TP_QUIET_NOTE moves the first rung and scales the rest; 0 disables the
+	// notes (some links stall happily every few seconds and the user has learned
+	// to ignore them).
+	v := os.Getenv("TP_QUIET_NOTE")
+	if v == "" {
+		return
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		quietNotesAt = nil
+		return
+	}
+	// The ladder is derived from the base (default 10s → 10s, 25s, 1m, 2m, 5m):
+	// someone who sets this to 30 has a link that stalls for a living and wants
+	// fewer, later notes, not a different shape of story.
+	base := time.Duration(n) * time.Second
+	quietNotesAt = []time.Duration{base, base * 5 / 2, base * 6, base * 12, base * 30}
+}
+
+// dlWatchStart arms the watchdog for a get that is about to be injected. Armed
+// before the command is handed over on purpose: on a link that paces input the
+// wait starts there, not when the remote answers, and "the remote never answered"
+// is the case the user most needs told.
+func dlWatchStart(name string) {
+	if len(quietNotesAt) == 0 {
+		return
+	}
+	dlWatch.Lock()
+	defer dlWatch.Unlock()
+	if dlWatch.quit != nil { // a previous get that never finished
+		close(dlWatch.quit)
+	}
+	dlWatch.quit = make(chan struct{})
+	dlWatch.name, dlWatch.got, dlWatch.total, dlWatch.begun = name, 0, 0, false
+	go dlWatchTick(dlWatch.quit)
+}
+
+// dlWatchStop disarms it. Called when the transfer ends by any route: verified,
+// failed, errored by the remote, or a link that died under it.
+func dlWatchStop() {
+	dlWatch.Lock()
+	defer dlWatch.Unlock()
+	if dlWatch.quit != nil {
+		close(dlWatch.quit)
+		dlWatch.quit = nil
+	}
+}
+
+// dlWatchBegin/Progress feed the watchdog what it reads out. They are no-ops
+// when it is not armed, so the capture path does not need to know about it.
+func dlWatchBegin(name string, total int64) {
+	dlWatch.Lock()
+	defer dlWatch.Unlock()
+	if dlWatch.quit == nil {
+		return
+	}
+	dlWatch.name, dlWatch.total, dlWatch.begun = name, total, true
+}
+
+func dlWatchProgress(got int64) {
+	dlWatch.Lock()
+	defer dlWatch.Unlock()
+	if dlWatch.quit == nil {
+		return
+	}
+	dlWatch.got = got
+}
+
+func dlWatchTick(quit chan struct{}) {
+	tick := time.NewTicker(quietTick)
+	defer tick.Stop()
+	rung, lastGot := 0, int64(-1)
+	for range tick.C {
+		select {
+		case <-quit:
+			return
+		default:
+		}
+		dlWatch.Lock()
+		if dlWatch.quit != quit { // superseded by a newer get
+			dlWatch.Unlock()
+			return
+		}
+		name, got, total, begun := dlWatch.name, dlWatch.got, dlWatch.total, dlWatch.begun
+		dlWatch.Unlock()
+
+		if got != lastGot { // moving again: the last stall was nothing to worry about
+			rung, lastGot = 0, got
+		}
+		silent := time.Since(time.Unix(0, atomic.LoadInt64(&lastPtyOut)))
+		if silent < quietNotesAt[rung] {
+			continue
+		}
+		last := rung == len(quietNotesAt)-1
+		quietSink(quietNote(name, got, total, begun, silent, rung, last))
+		if last {
+			dlWatchStop()
+			return
+		}
+		rung++
+	}
+}
+
+// quietNote words one status line. "Silence" is measured from the last pty byte
+// of any kind, so it says what tp actually knows: nothing has arrived, and here
+// is how much of it was expected. The final note names the two explanations
+// worth the user's attention, because both look identical from the chair.
+func quietNote(name string, got, total int64, begun bool, silent time.Duration, rung int, last bool) string {
+	what := "the remote to answer"
+	if begun {
+		what = "./" + name
+	}
+	have := "nothing received yet"
+	switch {
+	case begun && total > 0:
+		have = fmt.Sprintf("%s/%s received", humanSize(got), humanSize(total))
+	case begun:
+		have = fmt.Sprintf("%s received", humanSize(got))
+	}
+	// Bytes tp still holds are a different story than bytes the remote is slow
+	// with: the queue is on this side, draining into a link that paces input.
+	if q := injectBacklog(); q > 0 {
+		have += fmt.Sprintf(", tp is still pushing %s", humanSize(q))
+	}
+	if last {
+		return fmt.Sprintf("\r\033[1;33m[tp] ⚠ no progress on %s: %s of silence (%s). "+
+			"A bastion that renders what it forwards meters output line by line and looks exactly like "+
+			"this — so does a remote command that died. Press a key to see the shell; Ctrl+C twice quits tp."+
+			"\033[0m\n", what, silent.Round(time.Second), have)
+	}
+	return fmt.Sprintf("\r\033[1;36m[tp] …\033[0m still waiting for %s: %s of silence, %s\n",
+		what, silent.Round(time.Second), have)
 }
 
 func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode int, logFile string) {
@@ -384,6 +556,7 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] remote path too long for line-based download\033[0m\n")
 		return
 	}
+	dlWatchStart(remotePath)
 	injectCh <- []byte(inject)
 }
 

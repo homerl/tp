@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1166,5 +1168,127 @@ func TestPtyRawKeepsEcho(t *testing.T) {
 	}
 	if term.Cc[unix.VMIN] != 1 || term.Cc[unix.VTIME] != 0 {
 		t.Error("read should return on the first byte")
+	}
+}
+
+// TestQuietNoteWords checks what a stall says out loud. The whole point of the
+// watchdog is that "nothing moved" is never silent, and that the line names what
+// tp actually knows: which file, how much arrived, whether tp itself is still
+// pushing bytes into a link that paces input.
+func TestQuietNoteWords(t *testing.T) {
+	resetInject()
+	silent := 12 * time.Second
+
+	pre := quietNote("/remote/big.bin", 0, 0, false, silent, 0, false)
+	if !strings.Contains(pre, "waiting for the remote to answer") ||
+		!strings.Contains(pre, "nothing received yet") ||
+		!strings.Contains(pre, "12s") {
+		t.Errorf("pre-BEGIN note reads: %q", pre)
+	}
+	mid := quietNote("big.bin", 4<<20, 100<<20, true, silent, 0, false)
+	if !strings.Contains(mid, "waiting for ./big.bin") ||
+		!strings.Contains(mid, "4.00 MB/100.00 MB") {
+		t.Errorf("mid-transfer note reads: %q", mid)
+	}
+	// A backlog on tp's side is a different diagnosis than a slow remote, and
+	// saying so is the difference between "wait" and "the bastion is throttling".
+	atomic.StoreInt64(&injectQueued, 5000)
+	atomic.StoreInt64(&injectWritten, 1000)
+	queued := quietNote("big.bin", 4<<20, 100<<20, true, silent, 0, false)
+	if !strings.Contains(queued, "tp is still pushing 3.91 KB") {
+		t.Errorf("backlog not reported: %q", queued)
+	}
+	resetInject()
+
+	last := quietNote("big.bin", 4<<20, 100<<20, true, 5*time.Minute, 4, true)
+	for _, want := range []string{"no progress", "renders what it forwards", "Ctrl+C twice"} {
+		if !strings.Contains(last, want) {
+			t.Errorf("final note missing %q: %q", want, last)
+		}
+	}
+}
+
+// TestDownloadQuietWatchdog drives the ladder itself: with a pty that has gone
+// quiet, the watchdog must speak up, escalate, and then stop on its own — a
+// transfer orphaned by a Ctrl+C at the remote cannot be allowed to nag forever.
+func TestDownloadQuietWatchdog(t *testing.T) {
+	notes, tick, sink := quietNotesAt, quietTick, quietSink
+	defer func() {
+		quietNotesAt, quietTick, quietSink = notes, tick, sink
+		dlWatchStop()
+	}()
+	quietNotesAt = []time.Duration{20 * time.Millisecond, 60 * time.Millisecond}
+	quietTick = 5 * time.Millisecond
+
+	var mu sync.Mutex
+	var spoken []string
+	quietSink = func(note string) {
+		mu.Lock()
+		spoken = append(spoken, note)
+		mu.Unlock()
+	}
+
+	dlWatchStart("/remote/big.bin")
+	atomic.StoreInt64(&lastPtyOut, time.Now().Add(-time.Hour).UnixNano())
+	dlWatchBegin("big.bin", 100<<20)
+	dlWatchProgress(4 << 20)
+
+	armed := func() bool {
+		dlWatch.Lock()
+		defer dlWatch.Unlock()
+		return dlWatch.quit != nil
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for armed() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if armed() {
+		t.Fatal("watchdog never gave up on a transfer that received nothing for its whole ladder")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(spoken) < 2 {
+		t.Fatalf("got %d note(s), want at least 2: %q", len(spoken), spoken)
+	}
+	if !strings.Contains(spoken[0], "still waiting for ./big.bin") ||
+		!strings.Contains(spoken[0], "4.00 MB/100.00 MB") {
+		t.Errorf("first note: %q", spoken[0])
+	}
+	if !strings.Contains(spoken[len(spoken)-1], "no progress") {
+		t.Errorf("last note: %q", spoken[len(spoken)-1])
+	}
+}
+
+// TestDownloadQuietWatchdogStopsOnFinish checks the other end of the contract: a
+// download that ends — verified or failed — must not leave a watchdog behind to
+// explain a wait that is already over.
+func TestDownloadQuietWatchdogStopsOnFinish(t *testing.T) {
+	defer dlWatchStop()
+	dlWatchStart("/remote/x.bin")
+	dlWatch.Lock()
+	armed := dlWatch.quit != nil
+	dlWatch.Unlock()
+	if !armed && len(quietNotesAt) > 0 {
+		t.Fatal("dlWatchStart did not arm the watchdog")
+	}
+
+	dir := t.TempDir()
+	tmp := filepath.Join(dir, "x.bin.tmp")
+	if err := os.WriteFile(tmp, []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c := captureState{}
+	c.reset()
+	c.file, _ = os.Open(tmp)
+	c.tmpName = tmp
+	c.name = filepath.Join(dir, "x.bin")
+	c.b64err = errors.New("boom") // the failure path: temp removed, log kept
+	c.finish()
+
+	dlWatch.Lock()
+	defer dlWatch.Unlock()
+	if dlWatch.quit != nil {
+		t.Fatal("watchdog still armed after the transfer ended")
 	}
 }
