@@ -435,8 +435,8 @@ var getLog struct {
 func cmdSSH(args []string) int {
 	if len(args) < 1 {
 		fmt.Fprintf(os.Stderr, "usage: tp ssh <host> [ssh_args...]\n")
-		fmt.Fprintf(os.Stderr, "  In-session: !get <remote_path> [local_name]\n")
-		fmt.Fprintf(os.Stderr, "              !put <local_path> [remote_path]\n")
+		fmt.Fprintf(os.Stderr, "  In-session: @tp_get@! [-l <rate>] [-d 0|1] [-f <log>] <remote_path> [local_name]\n")
+		fmt.Fprintf(os.Stderr, "              @tp_put@! [-l <rate>] [-d 0|1] [-f <log>] <local_path> [remote_path]\n")
 		return 1
 	}
 
@@ -706,15 +706,14 @@ func cmdSSH(args []string) int {
 				}
 
 				// Decide whether this read is (the start of) a local transfer command.
-				// Buffer it if: we're already mid-command, the first real byte is `!`, the
-				// read is wrapped in bracketed-paste markers, or the text could still grow
-				// into a tp command ("get@! …" starts with an ordinary letter, so it needs
-				// this gate rather than a first-byte test).
+				// Buffer it if: we're already mid-command, the read is wrapped in
+				// bracketed-paste markers, or the text could still grow into
+				// "@tp_get@!" / "@tp_put@!".
 				// Keys with no glyph of their own (arrow keys, Ctrl+R, Tab, an empty Enter)
 				// are immediate actions for the remote's readline and can never start a tp
 				// command. Buffering one loses it — the buffer only keeps printable bytes —
 				// which is how Tab completion never reached the shell at all.
-				if len(pendingLine) > 0 || isBangStart(data) ||
+				if len(pendingLine) > 0 ||
 					bytes.HasPrefix(data, []byte("\x1b[200~")) ||
 					(hasGlyph(data) && couldBeTpCommand(string(data))) {
 					// A `!` command — typed directly, indented, or wrapped in
@@ -850,7 +849,7 @@ func cmdSSH(args []string) int {
 			switch lc.action {
 			case "get":
 				if lc.arg1 == "" {
-					fmt.Fprintln(os.Stderr, "\ntp: usage: get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]  (e.g. get@! -l 20K /tmp/f ~/Downloads/f)")
+					fmt.Fprintln(os.Stderr, "\ntp: usage: @tp_get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]  (e.g. @tp_get@! -l 20K /tmp/f ~/Downloads/f)")
 					continue
 				}
 				echoSup.clear() // don't let stale echo entries corrupt the marker/base64
@@ -860,7 +859,7 @@ func cmdSSH(args []string) int {
 				doNoRemoteGet(injectCh, lc.arg1, lc.arg2, lc.logMode, lc.logFile, lc.rateLimit)
 			case "put":
 				if lc.arg1 == "" {
-					fmt.Fprintln(os.Stderr, "\ntp: usage: put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]  (e.g. put@! -l 20K ~/f /tmp/f)")
+					fmt.Fprintln(os.Stderr, "\ntp: usage: @tp_put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]  (e.g. @tp_put@! -l 20K ~/f /tmp/f)")
 					continue
 				}
 				localPath := expandLocalPath(lc.arg1)

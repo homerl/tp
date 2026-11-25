@@ -440,27 +440,19 @@ const leadSpace = " "
 
 // tpCommands are the in-session transfer commands.
 //
-// The bang trails the word ("get@! /path") on purpose. bash only performs
-// history expansion on a "!" followed by something other than a space, tab or
-// newline, so a trailing bang is inert: the line can never be swallowed by
-// history expansion, which is what made the leading-bang spellings awkward to
-// type on a live shell (a forwarded "!get" comes back as "bash: !get: event not
-// found"). "!get"/"!put" are still accepted for muscle memory and existing docs.
-var tpCommands = []string{"get@!", "put@!", "!get", "!put"}
+// Both start with "@tp_" and end with "@!": starting with "@" avoids colliding
+// with normal shell commands (so ordinary typing is never buffered), and putting
+// the bang at the end keeps bash from history-expanding it.
+var tpCommands = []string{"@tp_get@!", "@tp_put@!"}
 
 // tpAction maps a typed first word to the transfer to run, or "" when the word
-// is not a tp command. The legacy "!get"/"!put" match as prefixes, as they
-// always have; the trailing-bang spellings must match exactly, so a word like
-// "get@1x" stays an ordinary argument.
+// is not a tp command. Matches exact whole words only, so "@tp_get@!x" stays an
+// ordinary argument.
 func tpAction(word string) string {
 	switch word {
-	case "get@!", "put@!":
-		return word[:3]
-	}
-	switch {
-	case strings.HasPrefix(word, "!get"):
+	case "@tp_get@!":
 		return "get"
-	case strings.HasPrefix(word, "!put"):
+	case "@tp_put@!":
 		return "put"
 	}
 	return ""

@@ -73,7 +73,7 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			line:    "get@! -l 20K /tmp/getfile ~/Downloads/getfile",
+			line:    "@tp_get@! -l 20K /tmp/getfile ~/Downloads/getfile",
 			action:  "get",
 			arg1:    "/tmp/getfile",
 			arg2:    "~/Downloads/getfile",
@@ -81,7 +81,7 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 			rate:    20 * 1024,
 		},
 		{
-			line:    "put@! -l 20K /tmp/getfile ~/Downloads/getfile",
+			line:    "@tp_put@! -l 20K /tmp/getfile ~/Downloads/getfile",
 			action:  "put",
 			arg1:    "/tmp/getfile",
 			arg2:    "~/Downloads/getfile",
@@ -89,7 +89,7 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 			rate:    20 * 1024,
 		},
 		{
-			line:    "get@! /tmp/f local.bin -d 0 -l 50K",
+			line:    "@tp_get@! /tmp/f local.bin -d 0 -l 50K",
 			action:  "get",
 			arg1:    "/tmp/f",
 			arg2:    "local.bin",
@@ -97,19 +97,19 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 			rate:    50 * 1024,
 		},
 		{
-			line:    "get@! /tmp/f -d 1",
+			line:    "@tp_get@! /tmp/f -d 1",
 			action:  "get",
 			arg1:    "/tmp/f",
 			logMode: 1,
 			rate:    0,
 		},
 		{
-			line:    "put@! -l badrate /tmp/f",
+			line:    "@tp_put@! -l badrate /tmp/f",
 			action:  "put",
 			wantErr: true,
 		},
 		{
-			line:    "get@! -d 2 /tmp/f",
+			line:    "@tp_get@! -d 2 /tmp/f",
 			action:  "get",
 			wantErr: true,
 		},

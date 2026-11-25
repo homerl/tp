@@ -35,8 +35,8 @@ Usage:
   tp version
 
 In-session commands (type these in the tp ssh terminal):
-  get@! [-l <rate>] <remote_path> [local_name]   Download a remote file
-  put@! [-l <rate>] <local_path> [remote_path]   Upload a local file
+  @tp_get@! [-l <rate>] [-d 0|1] [-f <log>] <remote_path> [local_name]   Download a remote file
+  @tp_put@! [-l <rate>] [-d 0|1] [-f <log>] <local_path> [remote_path]   Upload a local file
   (-l 20K / -r 20K limits transfer rate to 20 KiB/s; default unlimited)
 
 Workflow:
@@ -44,14 +44,11 @@ Workflow:
   # ... manually navigate to the target machine however you normally do ...
   # Now on the target machine:
 
-  get@! /tmp/bigfile.bin             # download
-  put@! ./local.txt /tmp/remote.txt  # upload
+  @tp_get@! /tmp/bigfile.bin             # download
+  @tp_put@! ./local.txt /tmp/remote.txt  # upload
 
-Both directions verify sha256 automatically.
+Both directions verify checksums automatically.
 The local 'tp ssh' silently intercepts data - you only see progress bars.
-'!get' / '!put' are accepted too. The bang trails the word because bash only
-history-expands a '!' followed by a non-space: a trailing bang can never be
-mistaken for history expansion, so the line always reaches tp.
 
 Slow links (some bastions pace pasted input): tp reports how much is still
 queued and waits for the remote instead of failing early. Tunables:
