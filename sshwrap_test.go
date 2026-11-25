@@ -1076,14 +1076,14 @@ func TestInjectedCommandsLeadWithSpace(t *testing.T) {
 // the leading-bang form was replaced. Matching is by whole word, so a heredoc
 // line or an argument that merely starts with "get" is not a command.
 func TestTpAction(t *testing.T) {
-	if got := tpAction("@tp_get@!"); got != "get" {
-		t.Errorf("tpAction(@tp_get@!) = %q, want get", got)
+	if got := tpAction("@tp_get@"); got != "get" {
+		t.Errorf("tpAction(@tp_get@) = %q, want get", got)
 	}
-	if got := tpAction("@tp_put@!"); got != "put" {
-		t.Errorf("tpAction(@tp_put@!) = %q, want put", got)
+	if got := tpAction("@tp_put@"); got != "put" {
+		t.Errorf("tpAction(@tp_put@) = %q, want put", got)
 	}
 	// Old spellings and non-exact matches must NOT trigger.
-	for _, w := range []string{"get@!", "put@!", "!get", "!put", "@tp_get@!x", "@tp_put@!x", "get", "put", "", "!", "git", "@tp_other@!"} {
+	for _, w := range []string{"@tp_get@!", "@tp_put@!", "get@!", "put@!", "!get", "!put", "@tp_get@x", "@tp_put@x", "get", "put", "", "!", "git", "@tp_other@"} {
 		if got := tpAction(w); got != "" {
 			t.Errorf("tpAction(%q) = %q, want no command", w, got)
 		}
@@ -1091,14 +1091,14 @@ func TestTpAction(t *testing.T) {
 }
 
 // TestCouldBeTpCommand gates line buffering: a line is held only while it could
-// still become "@tp_get@!" or "@tp_put@!", so ordinary commands (including
+// still become "@tp_get@" or "@tp_put@", so ordinary commands (including
 // "git", "get", "put", "!") go straight to the remote immediately.
 func TestCouldBeTpCommand(t *testing.T) {
-	held := []string{"", "@", "@t", "@tp", "@tp_", "@tp_g", "@tp_get@!", "@tp_p", "@tp_put@!",
-		"  @tp_get@!", "@tp_get@! /tmp/x", "@tp_put@! a b", "\t @tp_put@!",
+	held := []string{"", "@", "@t", "@tp", "@tp_", "@tp_g", "@tp_get@", "@tp_p", "@tp_put@",
+		"  @tp_get@", "@tp_get@ /tmp/x", "@tp_put@ a b", "\t @tp_put@",
 		// Held, and that is fine: it starts with a whole command, so tp keeps the
 		// line until Enter, where the whole-word check lets it through to the shell.
-		"@tp_get@!x"}
+		"@tp_get@x"}
 	for _, s := range held {
 		if !couldBeTpCommand(s) {
 			t.Errorf("couldBeTpCommand(%q) = false, want held", s)

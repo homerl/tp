@@ -4,7 +4,7 @@
 
 > 中文版 / Chinese version: [README_CN.md](README_CN.md)
 
-Wrap `ssh`, and inside the session use `@tp_get@!` / `@tp_put@!` to transfer files, with automatic checksums and resumable transfers.
+Wrap `ssh`, and inside the session use `@tp_get@` / `@tp_put@` to transfer files, with automatic checksums and resumable transfers.
 
 ### The best thing about this project
 
@@ -49,8 +49,8 @@ tp version
 Type directly in the `tp ssh` terminal:
 
 ```
-@tp_get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]
-@tp_put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]
+@tp_get@ [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]
+@tp_put@ [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]
 ```
 
 | Parameter | Description |
@@ -60,7 +60,7 @@ Type directly in the `tp ssh` terminal:
 | `-d 0` | Disable, transfer without recording |
 | `-f <file>` | Custom log file path (by default it auto-detects the resume log `<target filename>.tprlog`) |
 
-Commands start with `@tp_` to avoid colliding with ordinary shell commands and end with `!` so bash never history-expands them. Commands are matched as whole words only.
+Commands are wrapped in `@` (`@tp_get@` / `@tp_put@`) with no `!`, so they neither collide with ordinary shell commands nor trigger bash history expansion. Commands are matched as whole words only.
 
 ### Slow links and bastions
 
@@ -182,18 +182,18 @@ $ tp ssh jump1 -p 2222          # replaces 'ssh jump1 -p 2222'
 # ... manually jump to the target machine ...
 
 # Download
-@tp_get@! /tmp/bigfile.bin
+@tp_get@ /tmp/bigfile.bin
 [tp] ↓ 1.2 GB → ./bigfile.bin (resumable)
 [tp] ✓ ./bigfile.bin (1.2 GB) 42.3s 29.15 MB/s avg
 
 # Upload
-@tp_put@! ./local.txt /tmp/remote.txt
+@tp_put@ ./local.txt /tmp/remote.txt
 [tp] ↑ ./local.txt (3.4 MB) → /tmp/remote.txt
 [tp] ✓ /tmp/remote.txt uploaded OK
 
 ```
 
-After an interruption (Ctrl+C or network drop), re-run the same `@tp_get@!` / `@tp_put@!` and it resumes from where it stopped:
+After an interruption (Ctrl+C or network drop), re-run the same `@tp_get@` / `@tp_put@` and it resumes from where it stopped:
 
 ```
 [tp] ↻ /tmp/bigfile.bin → ./bigfile.bin (resume from block 87)
@@ -201,7 +201,7 @@ After an interruption (Ctrl+C or network drop), re-run the same `@tp_get@!` / `@
 
 ### Exiting and cancelling
 
-- Single Ctrl+C: cleanly aborts an active `@tp_get@!` / `@tp_put@!` transfer and restores the terminal (keeping resume state); when idle, forwards to the remote foreground process
+- Single Ctrl+C: cleanly aborts an active `@tp_get@` / `@tp_put@` transfer and restores the terminal (keeping resume state); when idle, forwards to the remote foreground process
 - Triple-tap Ctrl+C (3 times within 1.5s): exits tp and restores the terminal automatically
 - The remote `exit` also exits
 
@@ -246,7 +246,7 @@ Your keyboard
 │                                              │
 │  stdin reader ──→ forward keystrokes          │
 │       │                                       │
-│       ├── recognizes @tp_get@! / @tp_put@! commands     │
+│       ├── recognizes @tp_get@ / @tp_put@ commands     │
 │       │                                       │
 │       ▼                                       │
 │  PTY (tp ↔ ssh)                               │
@@ -267,7 +267,7 @@ Your keyboard
 └──────────────────────────────────────────────┘
 ```
 
-### Download (@tp_get@!) flow
+### Download (@tp_get@) flow
 
 1. tp injects a shell command into the SSH channel; the remote reads the file in 4 MiB chunks with `dd`
 2. Each chunk first sends a `__TP_BLOCK__ <n> <cksum>` tag, then the base64 of that chunk
@@ -276,7 +276,7 @@ Your keyboard
 5. On completion, `__TP_DONE__` triggers: rename the temp file to the target, delete the log
 6. On any failure: delete the temp file, keep the log (for resuming), leave the original file untouched
 
-### Upload (@tp_put@!) flow
+### Upload (@tp_put@) flow
 
 1. tp first probes whether the remote target exists (`__TP_EXISTS__`); if it does, it prompts y/N
 2. Inject `head -n N | base64 -d > tmp`
@@ -305,8 +305,8 @@ double-erased (tp's `\b \b` plus readline's `\b\e[K` wipes one column too many)
 and printed your password in clear text.
 
 Local echo survives in exactly two places, where the bytes genuinely never reach
-the remote: the `@tp_get@!` / `@tp_put@!` line you are typing, and the y/N overwrite
-answer. A released command line (typed `git status`, held as a possible `@tp_get@!`)
+the remote: the `@tp_get@` / `@tp_put@` line you are typing, and the y/N overwrite
+answer. A released command line (typed `git status`, held as a possible `@tp_get@`)
 is the one case where tp has already painted bytes the remote is about to echo,
 so it hands them to `echoSuppressor` to swallow that copy.
 
@@ -356,8 +356,8 @@ main.go         entrypoint, command dispatch
 session.go      tp ssh main session: PTY management, goroutine orchestration, !command parsing
 tty.go          local terminal handling: pty modes, echoSuppressor, ANSI parsing
 protocol.go     protocol tag parsing, remote probing, nonce
-download.go     @tp_get@! implementation: chunked download, stream base64 decode, resumption
-upload.go       @tp_put@! implementation: chunked upload, progress, checksums
+download.go     @tp_get@ implementation: chunked download, stream base64 decode, resumption
+upload.go       @tp_put@ implementation: chunked upload, progress, checksums
 resume.go       .tprlog log parsing
 util.go          utility functions (humanSize, progressTicker, etc.)
 e2e_test.go     end-to-end tests (simulates full PTY link)
@@ -371,7 +371,7 @@ go test ./...
 ```
 
 Test coverage:
-- Full `@tp_get@!` / `@tp_put@!` flow (simulated PTY + base64 stream)
+- Full `@tp_get@` / `@tp_put@` flow (simulated PTY + base64 stream)
 - Resumption (recovery after interruption)
 - Checksum failure handling
 - Overlap confirmation

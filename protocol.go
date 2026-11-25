@@ -440,19 +440,20 @@ const leadSpace = " "
 
 // tpCommands are the in-session transfer commands.
 //
-// Both start with "@tp_" and end with "@!": starting with "@" avoids colliding
-// with normal shell commands (so ordinary typing is never buffered), and putting
-// the bang at the end keeps bash from history-expanding it.
-var tpCommands = []string{"@tp_get@!", "@tp_put@!"}
+// Both are wrapped in "@" ("@tp_get@" / "@tp_put@"): starting with "@tp_"
+// avoids colliding with normal shell commands (so ordinary typing is never
+// buffered), and omitting "!" guarantees bash never triggers history expansion
+// even on a typo.
+var tpCommands = []string{"@tp_get@", "@tp_put@"}
 
 // tpAction maps a typed first word to the transfer to run, or "" when the word
-// is not a tp command. Matches exact whole words only, so "@tp_get@!x" stays an
+// is not a tp command. Matches exact whole words only, so "@tp_get@x" stays an
 // ordinary argument.
 func tpAction(word string) string {
 	switch word {
-	case "@tp_get@!":
+	case "@tp_get@":
 		return "get"
-	case "@tp_put@!":
+	case "@tp_put@":
 		return "put"
 	}
 	return ""

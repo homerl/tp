@@ -2,7 +2,7 @@
 
 > 多跳板机反复传输多份日志实在让人崩溃
 
-在 `ssh` 包一层，在会话里用 `@tp_get@!` / `@tp_put@!` 传文件，自动校验、断点续传。
+在 `ssh` 包一层，在会话里用 `@tp_get@` / `@tp_put@` 传文件，自动校验、断点续传。
 
 ### 这个项目最大的特点
 
@@ -48,8 +48,8 @@ tp version
 在 `tp ssh` 的终端里直接输入：
 
 ```
-@tp_get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]
-@tp_put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]
+@tp_get@ [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]
+@tp_put@ [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]
 ```
 
 | 参数 | 说明 |
@@ -59,7 +59,7 @@ tp version
 | `-d 0` | 关闭，纯传不记录 |
 | `-f <file>` | 自定义日志文件路径（默认会自动获取断点日志 `<目标文件名>.tprlog`） |
 
-命令以 `@tp_` 开头避免与普通 shell 命令冲突，同时感叹号放在词尾避免触发 bash 历史展开；按整词匹配，所以 `@tp_get@!x` 等其他文本会原样交给 shell。
+命令以 `@tp_` 开头、以 `@` 结尾且不含 `!`，既不会与普通 shell 命令冲突，也绝不会触发 bash 历史展开；按整词匹配，所以 `@tp_get@x` 等其他文本会原样交给 shell。
 
 ### 慢链路 / 堡垒机
 
@@ -132,18 +132,18 @@ $ tp ssh jump1 -p 2222          # 代替 ssh jump1 -p 2222
 # ... 手动跳转到目标机器 ...
 
 # 下载
-@tp_get@! /tmp/bigfile.bin
+@tp_get@ /tmp/bigfile.bin
 [tp] ↓ 1.2 GB → ./bigfile.bin (resumable)
 [tp] ✓ ./bigfile.bin (1.2 GB) 42.3s 29.15 MB/s avg
 
 # 上传
-@tp_put@! ./local.txt /tmp/remote.txt
+@tp_put@ ./local.txt /tmp/remote.txt
 [tp] ↑ ./local.txt (3.4 MB) → /tmp/remote.txt
 [tp] ✓ /tmp/remote.txt uploaded OK
 
 ```
 
-中断（Ctrl+C 或网络断了）后重新执行同一条 `@tp_get@!` / `@tp_put@!`，会从断点继续：
+中断（Ctrl+C 或网络断了）后重新执行同一条 `@tp_get@` / `@tp_put@`，会从断点继续：
 
 ```
 [tp] ↻ /tmp/bigfile.bin → ./bigfile.bin (resume from block 87)
@@ -151,7 +151,7 @@ $ tp ssh jump1 -p 2222          # 代替 ssh jump1 -p 2222
 
 ### 退出与中断
 
-- 单次 Ctrl+C：正在传文件时立即中断当前 `@tp_get@!` / `@tp_put@!` 传输并恢复终端（保留断点可续传）；空闲时转发给远端
+- 单次 Ctrl+C：正在传文件时立即中断当前 `@tp_get@` / `@tp_put@` 传输并恢复终端（保留断点可续传）；空闲时转发给远端
 - 连按 3 次 Ctrl+C（1.5 秒内按三次）：退出 tp，终端自动恢复
 - 远端 `exit` 也会退出
 
@@ -190,7 +190,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 │                                              │
 │  stdin reader ──→ 直接转发按键               │
 │       │                                      │
-│       ├── 识别 @tp_get@! / @tp_put@! 命令              │
+│       ├── 识别 @tp_get@ / @tp_put@ 命令              │
 │       │                                      │
 │       ▼                                      │
 │  PTY (tp ↔ ssh)                              │
@@ -211,7 +211,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 └──────────────────────────────────────────────┘
 ```
 
-### 下载 (@tp_get@!) 流程
+### 下载 (@tp_get@) 流程
 
 1. tp 往 SSH 通道注入一条 shell 命令，远端用 `dd` 按 4 MiB 分块读文件
 2. 每块先发一个 `__TP_BLOCK__ <序号> <校验和>` 标记，再发该块的 base64
@@ -220,7 +220,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 5. 全部完成后 `__TP_DONE__` 触发：rename 临时文件到目标，删除日志
 6. 任何一步失败：删除临时文件，保留日志（供续传），原文件不受影响
 
-### 上传 (@tp_put@!) 流程
+### 上传 (@tp_put@) 流程
 
 1. tp 先探测远端目标是否存在（`__TP_EXISTS__`），存在则弹 y/N
 2. 注入 `head -n N | base64 -d > tmp` 命令
@@ -236,7 +236,7 @@ tp 把自己的终端设成 raw mode（这样每个按键都能立刻拿到）�
 
 tp 以前在这里清掉了 `ECHO`，然后自己逐键回显。于是远端没东西可画，两个画家永远碰不上面——直到有人按了 ↑：readline 有东西要画，而 tp 根本无从知道。本地回显还会重复擦除（tp 的 `\b \b` 加上 readline 的 `\b\e[K`，多擦一格，把提示符都擦掉一角），而且会把你的密码明文画在屏幕上。
 
-现在本地回显只留在两个地方，因为那些字节确实不会到远端：你正在敲的 `@tp_get@!` / `@tp_put@!` 那一行，以及覆盖确认的 y/N。还有一种例外：你以为是在敲 `@tp_get@!`、结果是 `git status`——tp 已经把这些字符画上屏了，交给远端时会把他们放进 `echoSuppressor`，把远端的那一份吞掉。
+现在本地回显只留在两个地方，因为那些字节确实不会到远端：你正在敲的 `@tp_get@` / `@tp_put@` 那一行，以及覆盖确认的 y/N。还有一种例外：你以为是在敲 `@tp_get@`、结果是 `git status`——tp 已经把这些字符画上屏了，交给远端时会把他们放进 `echoSuppressor`，把远端的那一份吞掉。
 
 ### 为什么 tp 的命令不会进你的 shell 历史
 
