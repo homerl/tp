@@ -460,20 +460,22 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		}
 		if n > 0 {
 			if logF != nil {
-				// Feed the block hash, splitting at the blockSize boundary if this read
-				// straddles it (a read is <=24KiB, so it can cross at most one
-				// boundary). When the boundary is hit, log the just-finished block.
-				remaining := int64(blockSize) - blockBytes
-				if int64(n) <= remaining {
-					blockHash.Write(buf[:n])
-					blockBytes += int64(n)
-				} else {
-					blockHash.Write(buf[:remaining])
+				// Feed the block hash across one or more blockSize boundaries
+				// (e.g. a 24 KiB read spans multiple 16 KiB blocks when rate-limited).
+				remData := buf[:n]
+				for len(remData) > 0 {
+					remaining := int64(blockSize) - blockBytes
+					if int64(len(remData)) < remaining {
+						blockHash.Write(remData)
+						blockBytes += int64(len(remData))
+						break
+					}
+					blockHash.Write(remData[:remaining])
 					logPutBlock(logF, blockNum, blockHash)
 					blockNum++
 					blockHash = xxhash.New()
-					blockHash.Write(buf[remaining:])
-					blockBytes = int64(n) - remaining
+					remData = remData[remaining:]
+					blockBytes = 0
 				}
 			}
 			pending = append(pending, base64.StdEncoding.EncodeToString(buf[:n])...)

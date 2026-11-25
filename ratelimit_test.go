@@ -49,11 +49,11 @@ func TestBlockSizeForRate(t *testing.T) {
 		want int
 	}{
 		{0, tpBlockSize},
-		{5 * 1024, 64 * 1024},
-		{10 * 1024, 128 * 1024},
-		{20 * 1024, 256 * 1024},
-		{50 * 1024, 1024 * 1024},
-		{500 * 1024, tpBlockSize},
+		{5 * 1024, 16 * 1024},
+		{10 * 1024, 16 * 1024},
+		{20 * 1024, 16 * 1024},
+		{50 * 1024, 16 * 1024},
+		{500 * 1024, 16 * 1024},
 	}
 	for _, tc := range cases {
 		if got := blockSizeForRate(tc.rate); got != tc.want {

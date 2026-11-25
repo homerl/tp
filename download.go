@@ -456,30 +456,19 @@ func quietNote(name string, got, total int64, begun bool, silent time.Duration, 
 		what, silent.Round(time.Second), have)
 }
 
+// tpRateLimitBlockSize is the per-block checksum/resume unit used whenever
+// rate limiting (-l <rate>) is active (16 KiB). At throttled speeds like 20K/s,
+// each block takes ~1s, so any interruption or dropped byte costs almost nothing
+// to resume.
+const tpRateLimitBlockSize = 16 * 1024
+
 // blockSizeForRate picks the per-block checksum/resume unit for a given wire
-// rate limit. Unlimited transfers use 4 MiB; rate-limited transfers scale the
-// block size down so each block takes ~15-20s (between 64 KiB and 4 MiB), so
-// an interrupted or dropped block on a throttled bastion loses seconds rather
-// than minutes.
+// rate limit. Unlimited transfers use 4 MiB; rate-limited transfers use 16 KiB.
 func blockSizeForRate(rateLimit int64) int {
 	if rateLimit <= 0 {
 		return tpBlockSize
 	}
-	target := rateLimit * 3 / 4 * 15
-	for _, sz := range []int{
-		64 * 1024,
-		128 * 1024,
-		256 * 1024,
-		512 * 1024,
-		1024 * 1024,
-		2 * 1024 * 1024,
-		tpBlockSize,
-	} {
-		if int64(sz) >= target {
-			return sz
-		}
-	}
-	return tpBlockSize
+	return tpRateLimitBlockSize
 }
 
 // downloadB64Cmd returns the remote shell snippet that base64-encodes
