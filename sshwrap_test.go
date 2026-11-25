@@ -1201,7 +1201,7 @@ func TestQuietNoteWords(t *testing.T) {
 	resetInject()
 
 	last := quietNote("big.bin", 4<<20, 100<<20, true, 5*time.Minute, 4, true)
-	for _, want := range []string{"no progress", "renders what it forwards", "Ctrl+C twice"} {
+	for _, want := range []string{"no progress", "renders what it forwards", "3x Ctrl+C"} {
 		if !strings.Contains(last, want) {
 			t.Errorf("final note missing %q: %q", want, last)
 		}

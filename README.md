@@ -204,10 +204,10 @@ After an interruption (Ctrl+C or network drop), re-run the same `get@!` / `put@!
 [tp] ↻ /tmp/bigfile.bin → ./bigfile.bin (resume from block 87)
 ```
 
-### Exiting
+### Exiting and cancelling
 
-- Double-tap Ctrl+C (twice within 1.5s) to exit tp; the terminal restores automatically
-- A single Ctrl+C is forwarded to the remote end (interrupts the remote foreground process)
+- Single Ctrl+C: cleanly aborts an active `get@!` / `put@!` transfer and restores the terminal (keeping resume state); when idle, forwards to the remote foreground process
+- Triple-tap Ctrl+C (3 times within 1.5s): exits tp and restores the terminal automatically
 - The remote `exit` also exits
 
 ## Debugging

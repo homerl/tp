@@ -219,6 +219,22 @@ func putAbort(suppress *int32, remotePath string) {
 	fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] ✗ connection lost; %s not uploaded (re-run to resume)\033[0m\n", remotePath)
 }
 
+// putCancelled aborts an in-flight upload after a single Ctrl+C, restores
+// remote echo, and releases local output suppression.
+func putCancelled(injectCh chan<- []byte, suppress *int32, qTmp, remotePath, nonce string, logMode int) {
+	injectBestEffort(injectCh, []byte{3})
+	injectBestEffort(injectCh, []byte("\n"))
+	if logMode == 1 {
+		injectBestEffort(injectCh, []byte(leadSpace+fmt.Sprintf("stty echo 2>/dev/null #%s\n", nonce)))
+		atomic.StoreInt32(suppress, 0)
+		fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ⚠ upload of %s cancelled (Ctrl+C; re-run to resume)\033[0m\n", remotePath)
+		return
+	}
+	injectBestEffort(injectCh, []byte(leadSpace+fmt.Sprintf("stty echo 2>/dev/null; rm -f %s 2>/dev/null #%s\n", qTmp, nonce)))
+	atomic.StoreInt32(suppress, 0)
+	fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ⚠ upload of %s cancelled (Ctrl+C)\033[0m\n", remotePath)
+}
+
 // doNoRemotePut uploads without tp on the remote. The remote runs a single
 // `head -n N | base64 -d` (see putCmdLine for why that survives multi-hop
 // chains); a corrupt transfer fails the size guard and never clobbers the
@@ -380,6 +396,9 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ↑ ./%s (%s) → %s%s\033[0m\n",
 		localPath, humanSize(fileSize), remotePath, rateTag)
 
+	cancelCh := startPutCancel()
+	defer stopPutCancel()
+
 	// Register for verification
 	resultCh := make(chan string, 1)
 	pendingPut.mu.Lock()
@@ -437,6 +456,9 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	putTicker.start(0)
 
 	sendLine := func(ln []byte) bool {
+		if isCancelled(cancelCh) {
+			return false
+		}
 		payload := append(append([]byte{}, ln...), '\n')
 		if !injectWait(injectCh, payload) {
 			return false
@@ -446,13 +468,21 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 			wireBytes += int64(len(payload))
 			wantElapsed := time.Duration(float64(wireBytes) / float64(rateLimit) * float64(time.Second))
 			if wait := wantElapsed - time.Since(start); wait > 0 {
-				time.Sleep(wait)
+				select {
+				case <-time.After(wait):
+				case <-cancelCh:
+					return false
+				}
 			}
 		}
 		return true
 	}
 
 	for {
+		if isCancelled(cancelCh) {
+			putCancelled(injectCh, suppress, qTmp, remotePath, nonce, logMode)
+			return
+		}
 		n, rerr := io.ReadFull(lf, buf)
 		if atomic.LoadInt32(&linkDead) == 1 {
 			putAbort(suppress, remotePath)
@@ -483,7 +513,11 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 			// Emit complete data lines (copy: pending's backing array is reused)
 			for len(pending) >= lineLen {
 				if !sendLine(pending[:lineLen]) {
-					putAbort(suppress, remotePath)
+					if isCancelled(cancelCh) {
+						putCancelled(injectCh, suppress, qTmp, remotePath, nonce, logMode)
+					} else {
+						putAbort(suppress, remotePath)
+					}
 					return
 				}
 				pending = pending[lineLen:]
@@ -509,7 +543,11 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	// Flush the final partial line
 	if len(pending) > 0 {
 		if !sendLine(pending) {
-			putAbort(suppress, remotePath)
+			if isCancelled(cancelCh) {
+				putCancelled(injectCh, suppress, qTmp, remotePath, nonce, logMode)
+			} else {
+				putAbort(suppress, remotePath)
+			}
 			return
 		}
 	}
@@ -539,14 +577,18 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	// of unread data. Saying "sent" and starting the verify clock at that moment
 	// turns a perfectly healthy transfer into a spurious "verification timed
 	// out", so drain first and say what we are waiting on while we do it.
-	if !waitInjectDrained(func(n int64) {
+	if !waitInjectDrainedCancel(cancelCh, func(n int64) {
 		if n > 0 {
 			fmt.Fprintf(os.Stderr, "\r\033[1;33m[tp] ↑\033[0m link is slower than tp can read: %s still queued   ", humanSize(n))
 		} else {
 			fmt.Fprint(os.Stderr, "\r\033[K")
 		}
 	}) {
-		putAbort(suppress, remotePath)
+		if isCancelled(cancelCh) {
+			putCancelled(injectCh, suppress, qTmp, remotePath, nonce, logMode)
+		} else {
+			putAbort(suppress, remotePath)
+		}
 		return
 	}
 
@@ -593,6 +635,9 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	timedOut := false
 	for !gotResult && !timedOut {
 		select {
+		case <-cancelCh:
+			putCancelled(injectCh, suppress, qTmp, remotePath, nonce, logMode)
+			return
 		case remoteSha = <-resultCh:
 			gotResult = true
 		case <-timeout:

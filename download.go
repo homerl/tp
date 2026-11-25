@@ -361,6 +361,54 @@ func dlWatchStart(name string) {
 
 // dlWatchStop disarms it. Called when the transfer ends by any route: verified,
 // failed, errored by the remote, or a link that died under it.
+// dlWatchActive reports whether a download is currently in flight (waiting for
+// __TP_BEGIN__ or receiving data).
+func dlWatchActive() bool {
+	dlWatch.Lock()
+	defer dlWatch.Unlock()
+	return dlWatch.quit != nil
+}
+
+// abortActiveGet cancels an in-progress download on single Ctrl+C, releasing
+// capture mode so the user immediately gets their interactive terminal back.
+// Returns true if a download was active.
+func abortActiveGet(capMu *sync.Mutex, cap *captureState) bool {
+	capMu.Lock()
+	active := cap.capturing || dlWatchActive()
+	if !active {
+		capMu.Unlock()
+		return false
+	}
+	resumable := cap.logName != "" && cap.blocksDone > 0
+	name := cap.name
+	if cap.file != nil {
+		cap.file.Close()
+		cap.file = nil
+	}
+	if cap.logFile != nil {
+		cap.logFile.Close()
+		cap.logFile = nil
+	}
+	if !resumable {
+		if cap.tmpName != "" {
+			os.Remove(cap.tmpName)
+		}
+		if cap.logName != "" {
+			os.Remove(cap.logName)
+		}
+	}
+	cap.capturing = false
+	capMu.Unlock()
+
+	dlWatchStop()
+	if resumable {
+		fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ⚠ download of ./%s cancelled (Ctrl+C; re-run to resume)\033[0m\n", name)
+	} else {
+		fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ⚠ download cancelled (Ctrl+C)\033[0m\n")
+	}
+	return true
+}
+
 func dlWatchStop() {
 	dlWatch.Lock()
 	defer dlWatch.Unlock()
@@ -449,7 +497,7 @@ func quietNote(name string, got, total int64, begun bool, silent time.Duration, 
 	if last {
 		return fmt.Sprintf("\r\033[1;33m[tp] ⚠ no progress on %s: %s of silence (%s). "+
 			"A bastion that renders what it forwards meters output line by line and looks exactly like "+
-			"this — so does a remote command that died. Press a key to see the shell; Ctrl+C twice quits tp."+
+			"this — so does a remote command that died. Press a key to see the shell; Ctrl+C aborts download, 3x Ctrl+C quits tp."+
 			"\033[0m\n", what, silent.Round(time.Second), have)
 	}
 	return fmt.Sprintf("\r\033[1;36m[tp] …\033[0m still waiting for %s: %s of silence, %s\n",

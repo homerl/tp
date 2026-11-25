@@ -21,10 +21,89 @@ import (
 	"golang.org/x/term"
 )
 
-// ctrlCExitWindow: two Ctrl+C presses closer than this apart exit tp.
-// (ISIG is off on the local tty, so a lone Ctrl+C is forwarded to the
-// remote; only a quick second press is reserved for quitting tp.)
-const ctrlCExitWindow = 1500 * time.Millisecond
+// ctrlCExitWindow and ctrlCExitCount: three Ctrl+C presses within 1.5s exit tp.
+// (ISIG is off on the local tty, so a single Ctrl+C aborts an active transfer
+// or forwards to the remote; only three rapid presses quit tp.)
+const (
+	ctrlCExitWindow = 1500 * time.Millisecond
+	ctrlCExitCount  = 3
+)
+
+// ctrlCTracker tracks recent Ctrl+C timestamps within ctrlCExitWindow and
+// reports when the threshold (ctrlCExitCount) is reached.
+type ctrlCTracker struct {
+	times []time.Time
+}
+
+func (t *ctrlCTracker) record(now time.Time, count int) bool {
+	if count <= 0 {
+		return false
+	}
+	kept := t.times[:0]
+	for _, ts := range t.times {
+		if now.Sub(ts) < ctrlCExitWindow {
+			kept = append(kept, ts)
+		}
+	}
+	t.times = kept
+	for i := 0; i < count; i++ {
+		t.times = append(t.times, now)
+	}
+	return len(t.times) >= ctrlCExitCount
+}
+
+// putCancel coordinates single-Ctrl+C cancellation of an active !put upload.
+var putCancel struct {
+	mu     sync.Mutex
+	active bool
+	ch     chan struct{}
+}
+
+func startPutCancel() chan struct{} {
+	putCancel.mu.Lock()
+	defer putCancel.mu.Unlock()
+	ch := make(chan struct{})
+	putCancel.active = true
+	putCancel.ch = ch
+	return ch
+}
+
+func stopPutCancel() {
+	putCancel.mu.Lock()
+	defer putCancel.mu.Unlock()
+	putCancel.active = false
+	putCancel.ch = nil
+}
+
+// cancelActivePut signals the active !put upload (if any) to abort and reports
+// whether a put was active.
+func cancelActivePut() bool {
+	putCancel.mu.Lock()
+	defer putCancel.mu.Unlock()
+	if !putCancel.active {
+		return false
+	}
+	if putCancel.ch != nil {
+		select {
+		case <-putCancel.ch:
+		default:
+			close(putCancel.ch)
+		}
+	}
+	return true
+}
+
+func isCancelled(ch <-chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
 
 // ensureCRLF makes sure every \n in b is preceded by a \r. Remote ptys with
 // OPOST/ONLCR disabled emit bare \n; without the \r the local terminal
@@ -194,10 +273,14 @@ func (w *stallWatch) stalled() bool {
 // dead. progress, when non-nil, is called about once a second with the bytes
 // still queued, so a long wait does not read as a hang.
 func waitInjectDrained(progress func(int64)) bool {
+	return waitInjectDrainedCancel(nil, progress)
+}
+
+func waitInjectDrainedCancel(cancelCh <-chan struct{}, progress func(int64)) bool {
 	w := newStallWatch()
 	var lastReport time.Time
 	for injectBacklog() > 0 {
-		if w.stalled() || atomic.LoadInt32(&linkDead) == 1 {
+		if w.stalled() || atomic.LoadInt32(&linkDead) == 1 || isCancelled(cancelCh) {
 			return false
 		}
 		if progress != nil && time.Since(lastReport) >= time.Second {
@@ -462,13 +545,12 @@ func cmdSSH(args []string) int {
 	cmdCh := make(chan localCmd, 1)
 	var suppress int32
 	var echoSup echoSuppressor
+	var capMu sync.Mutex
+	var cap captureState
 
 	// === PTY output → local stdout (fix \r\n double translation) ===
 	go func() {
-		var (
-			lineBuf []byte
-			cap     captureState
-		)
+		var lineBuf []byte
 
 		buf := make([]byte, 8192)
 		for {
@@ -477,12 +559,15 @@ func cmdSSH(args []string) int {
 				atomic.StoreInt64(&lastPtyOut, time.Now().UnixNano())
 				dbg("pty out %d bytes: %s", n, dbgQuote(buf[:n]))
 				incoming := buf[:n]
+				capMu.Lock()
+				capturing := cap.capturing
+				capMu.Unlock()
 				// Drop the remote's duplicate of our local echo (see echoSuppressor),
 				// but only for normal interactive output — NEVER during a !get/!put
 				// transfer, where the stream is base64/markers and any filtering would
 				// corrupt it (a single eaten byte breaks base64 decode and leaks the
 				// whole line to the screen).
-				if !cap.capturing && atomic.LoadInt32(&suppress) == 0 {
+				if !capturing && atomic.LoadInt32(&suppress) == 0 {
 					var kept []byte
 					consumed := 0
 					for _, b := range incoming {
@@ -517,13 +602,18 @@ func cmdSSH(args []string) int {
 					// Normalise to \r\n for local display (remote may emit bare \n).
 					line = ensureCRLF(line)
 
+					capMu.Lock()
 					handleLine(line, &cap)
+					capMu.Unlock()
 				}
 
 				// Incomplete line: forward immediately unless it might be a TP marker.
 				// No minimum-length gate: the remote shell echoes each keystroke
 				// as 1-2 bytes, so gating on length would make typing invisible.
-				if len(lineBuf) > 0 && !cap.capturing && atomic.LoadInt32(&suppress) == 0 {
+				capMu.Lock()
+				capturing = cap.capturing
+				capMu.Unlock()
+				if len(lineBuf) > 0 && !capturing && atomic.LoadInt32(&suppress) == 0 {
 					if !mightBeMarker(lineBuf) {
 						os.Stdout.Write(ensureCRLF(lineBuf))
 						lineBuf = nil
@@ -535,6 +625,7 @@ func cmdSSH(args []string) int {
 					os.Stdout.Write(ensureCRLF(lineBuf))
 				}
 				dlWatchStop() // the link is gone; a note about waiting would be a lie
+				capMu.Lock()
 				if cap.file != nil {
 					// The link died (e.g. ssh disconnected) mid-download. Remove
 					// the partial temp file so the original target — if any — is
@@ -549,6 +640,7 @@ func cmdSSH(args []string) int {
 							humanSize(cap.size), cap.name)
 					}
 				}
+				capMu.Unlock()
 				return
 			}
 		}
@@ -563,11 +655,11 @@ func cmdSSH(args []string) int {
 		var pendingLine []byte
 
 		// ISIG is off and the tty is raw, so Ctrl+C shows up here as a literal
-		// 0x03 byte rather than raising SIGINT. Forward a lone press to the
-		// remote (interrupt its foreground job); a second press within
-		// ctrlCExitWindow quits tp — the only keyboard way to kill it, since
-		// Ctrl+C no longer arrives as a signal.
-		var lastCtrlC time.Time
+		// 0x03 byte rather than raising SIGINT.
+		// - 1st Ctrl+C during an active transfer aborts that transfer cleanly;
+		//   outside a transfer it is forwarded to the remote.
+		// - 3 Ctrl+C presses within ctrlCExitWindow quit tp.
+		var ctrlC ctrlCTracker
 		// confirmBuf accumulates the user's answer while a !put overwrite
 		// confirmation is pending (see captureConfirm).
 		var confirmBuf []byte
@@ -578,19 +670,17 @@ func cmdSSH(args []string) int {
 				data := buf[:n]
 				dbg("stdin read %d bytes: %s", n, dbgQuote(data))
 
-				// Two Ctrl+C within the window (or both in a single read) → quit tp.
+				// Three Ctrl+C within the window → quit tp.
 				if c := bytes.Count(data, []byte{0x03}); c > 0 {
-					now := time.Now()
-					if c >= 2 || now.Sub(lastCtrlC) < ctrlCExitWindow {
+					if ctrlC.record(time.Now(), c) {
 						restoreLocalTermios()
-						fmt.Fprintln(os.Stderr, "\ntp: exiting (double Ctrl+C)")
+						fmt.Fprintln(os.Stderr, "\ntp: exiting (triple Ctrl+C)")
 						os.Exit(130)
 					}
-					lastCtrlC = now
 				}
 
 				// If a !put overwrite confirmation is pending, capture this input as
-				// the answer instead of forwarding it to the remote. The double-Ctrl+C
+				// the answer instead of forwarding it to the remote. The triple-Ctrl+C
 				// quit above still takes priority, so the user can always break out.
 				putGuard.mu.Lock()
 				answerCh := putGuard.answerCh
@@ -599,6 +689,20 @@ func cmdSSH(args []string) int {
 					dbg("stdin: capturing confirm input %q", dbgQuote(data))
 					captureConfirm(data, &confirmBuf, answerCh)
 					continue
+				}
+
+				// Single Ctrl+C during an active transfer aborts the transfer cleanly
+				// instead of leaving tp stuck in capture/suppress mode.
+				if bytes.IndexByte(data, 0x03) >= 0 {
+					if cancelActivePut() {
+						pendingLine = nil
+						continue
+					}
+					if abortActiveGet(&capMu, &cap) {
+						pendingLine = nil
+						f.Write([]byte{0x03})
+						continue
+					}
 				}
 
 				// Decide whether this read is (the start of) a local transfer command.

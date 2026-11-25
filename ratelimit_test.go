@@ -335,3 +335,69 @@ func TestPTYDownloadRateLimitedRoundTrip(t *testing.T) {
 	}
 	t.Logf("rate-limited download (12 KiB @ 20K/s) succeeded in %v", elapsed.Round(time.Millisecond))
 }
+
+func TestCtrlCTrackerTripleExit(t *testing.T) {
+	var tr ctrlCTracker
+	t0 := time.Now()
+	if tr.record(t0, 1) {
+		t.Fatal("1st Ctrl+C should not exit")
+	}
+	if tr.record(t0.Add(300*time.Millisecond), 1) {
+		t.Fatal("2nd Ctrl+C should not exit")
+	}
+	if !tr.record(t0.Add(600*time.Millisecond), 1) {
+		t.Fatal("3rd Ctrl+C within 1.5s should exit")
+	}
+
+	// Expired timestamps should not count toward triple exit.
+	var tr2 ctrlCTracker
+	tr2.record(t0, 2)
+	if tr2.record(t0.Add(2*time.Second), 1) {
+		t.Fatal("1 Ctrl+C after window expired should not exit")
+	}
+}
+
+func TestSingleCtrlCAbortsActiveGet(t *testing.T) {
+	dir := t.TempDir()
+	tmpPath := filepath.Join(dir, "x.bin.tptmp")
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	cap := captureState{
+		capturing: true,
+		file:      f,
+		tmpName:   tmpPath,
+		name:      "x.bin",
+	}
+	dlWatchStart("x.bin")
+
+	if !abortActiveGet(&mu, &cap) {
+		t.Fatal("abortActiveGet returned false for active download")
+	}
+	if cap.capturing {
+		t.Fatal("cap.capturing should be false after abort")
+	}
+	if dlWatchActive() {
+		t.Fatal("dlWatch should be stopped after abort")
+	}
+	// Second call with no active download returns false.
+	if abortActiveGet(&mu, &cap) {
+		t.Fatal("abortActiveGet should return false when idle")
+	}
+}
+
+func TestSingleCtrlCAbortsActivePut(t *testing.T) {
+	if cancelActivePut() {
+		t.Fatal("cancelActivePut should return false when idle")
+	}
+	ch := startPutCancel()
+	defer stopPutCancel()
+	if !cancelActivePut() {
+		t.Fatal("cancelActivePut should return true when put is active")
+	}
+	if !isCancelled(ch) {
+		t.Fatal("cancel channel should be closed")
+	}
+}

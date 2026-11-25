@@ -149,10 +149,10 @@ put@! ./local.txt /tmp/remote.txt
 [tp] ↻ /tmp/bigfile.bin → ./bigfile.bin (resume from block 87)
 ```
 
-### 退出
+### 退出与中断
 
-- 双击 Ctrl+C（1.5 秒内按两次）退出 tp，终端自动恢复
-- 单次 Ctrl+C 转发给远端（中断远端前台进程）
+- 单次 Ctrl+C：正在传文件时立即中断当前 `get@!` / `put@!` 传输并恢复终端（保留断点可续传）；空闲时转发给远端
+- 连按 3 次 Ctrl+C（1.5 秒内按三次）：退出 tp，终端自动恢复
 - 远端 `exit` 也会退出
 
 ## 调试
