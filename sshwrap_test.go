@@ -76,7 +76,7 @@ func TestPutLineGeneration(t *testing.T) {
 			if !okT || !okO {
 				t.Fatal("dq rejected test path")
 			}
-			cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false, "testnonce0000000")
+			cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false, 0, "testnonce0000000")
 			if len(cmdLine) > 4095 {
 				t.Fatalf("command line too long: %d bytes", len(cmdLine))
 			}
@@ -1006,7 +1006,7 @@ func TestProbeCommandsTagResponses(t *testing.T) {
 	cases := map[string]string{
 		"exists":   existsProbe(`"/tmp/x"`, nonce),
 		"tmp_size": tmpSizeProbe(`"/tmp/x.tptmp"`, nonce),
-		"cksum":    cksumProbe(`"/tmp/x.tptmp"`, []int{0, 1}, nonce),
+		"cksum":    cksumProbe(`"/tmp/x.tptmp"`, []int{0, 1}, tpBlockSize, nonce),
 	}
 	for name, cmd := range cases {
 		if !strings.Contains(cmd, `"#`+nonce+`"`) {
@@ -1050,12 +1050,12 @@ func TestInjectedCommandsLeadWithSpace(t *testing.T) {
 		t.Fatal("dq rejected a plain path")
 	}
 	qTmp, _ := dq("/tmp/f.tpTMP")
-	cmdLine, _ := putCmdLine(q, qTmp, 100, 100, false, "nn")
+	cmdLine, _ := putCmdLine(q, qTmp, 100, 100, false, 0, "nn")
 	cases := map[string]string{
 		"exists":  existsProbe(q, "nn"),
 		"tmpsize": tmpSizeProbe(qTmp, "nn"),
-		"cksum":   cksumProbe(q, []int{0, 1}, "nn"),
-		"trunc":   truncateCmd(qTmp, 40, "nn"),
+		"cksum":   cksumProbe(q, []int{0, 1}, tpBlockSize, "nn"),
+		"trunc":   truncateCmd(qTmp, 40, tpBlockSize, "nn"),
 		"put":     cmdLine,
 	}
 	for name, cmd := range cases {

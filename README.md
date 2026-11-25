@@ -49,12 +49,13 @@ tp version
 Type directly in the `tp ssh` terminal:
 
 ```
-get@! <remote_path> [local_name] [-l 0|1] [-f <log_file>]
-put@! <local_path> [remote_path] [-l 0|1] [-f <log_file>]
+get@! [-l <rate>|0|1] [-f <log_file>] <remote_path> [local_name]
+put@! [-l <rate>|0|1] [-f <log_file>] <local_path> [remote_path]
 ```
 
 | Parameter | Description |
 |------|------|
+| `-l <rate>` / `-r <rate>` | Rate limit (**unlimited by default**), e.g. `-l 20K`, `-l 500K`, `-l 2M`, to prevent bastion buffer overflows (flags may appear before or after paths; local paths expand `~/`) |
 | `-l 1` | Enable logging / resumption (**default is 1**) |
 | `-l 0` | Disable, transfer without recording |
 | `-f <file>` | Custom log file path (by default it auto-detects the resume log `<target filename>.tprlog`) |
@@ -284,7 +285,7 @@ Your keyboard
 
 1. tp first probes whether the remote target exists (`__TP_EXISTS__`); if it does, it prompts y/N
 2. Inject `head -n N | base64 -d > tmp`
-3. Feed the base64 data into the PTY in rows of 3765 chars (to avoid the 4096 line-buffer limit)
+3. Feed the base64 data into the PTY in rows of 4000 chars (to avoid the 4096 line-buffer limit; with `-l <rate>`, automatically uses shorter lines and paces writes smoothly)
 4. `head` exits automatically once N lines are read (no reliance on ^D, safe across multi-layer jumps)
 5. The remote verifies the temp file size → renames it to the target → reports sha256 (`__TP_DONE__ <sha>`)
 6. The local side compares sha256; only a match counts as success

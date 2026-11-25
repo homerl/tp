@@ -16,9 +16,26 @@ import (
 
 // putDataLineLen: base64 characters per data line. The remote PTY is in
 // canonical mode with a 4096-byte line buffer; input lines longer than that
-// get truncated by the tty driver, silently corrupting the transfer. 3765
-// keeps a safe margin.
+// get truncated by the tty driver, silently corrupting the transfer. 4000
+// keeps a safe margin below the 4096-byte limit.
 const putDataLineLen = 4000
+
+// putLineLenForRate chooses the base64 line width for an upload. When rate
+// limiting is active, shorter lines (256..1024 chars) keep each write burst
+// small (~50-100ms) so intermediate bastion buffers don't overflow.
+func putLineLenForRate(rateLimit int64) int {
+	if rateLimit <= 0 {
+		return putDataLineLen
+	}
+	w := int(rateLimit / 10)
+	if w < 256 {
+		w = 256
+	}
+	if w > 1024 {
+		w = 1024
+	}
+	return w
+}
 
 // putCmdLine builds the single remote command for uploading fileSize bytes
 // sent as N base64 data lines, and returns that command plus N.
@@ -32,13 +49,14 @@ const putDataLineLen = 4000
 //
 // The decoded data goes to a temp file and is moved over the target only if
 // its size matches, so a corrupt transfer never clobbers an existing file.
-func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool, nonce string) (string, int) {
+func putCmdLine(qTarget, qTmp string, sendSize, fileSize int64, resume bool, rateLimit int64, nonce string) (string, int) {
 	// sendSize is how many bytes THIS run transmits (the remaining blocks when
 	// resuming, the whole file otherwise); it sets N, the number of data lines
 	// head will read. fileSize is the final on-disk size the temp must reach
 	// before it's moved over the target (always the full file size).
+	lineLen := putLineLenForRate(rateLimit)
 	b64Len := (sendSize + 2) / 3 * 4
-	n := (int(b64Len) + putDataLineLen - 1) / putDataLineLen
+	n := (int(b64Len) + lineLen - 1) / lineLen
 	redirect := ">"
 	if resume {
 		redirect = ">>"
@@ -141,31 +159,31 @@ func logPutBlock(f *os.File, blockNum int, h hash.Hash) {
 // 0..N-1 run. It returns the block to resume from (N) and the total block count
 // from the header; (0, 0) means "no valid log, start fresh". A stale log (wrong
 // filename or a gap in the block numbers) is removed.
-func checkPutResumeLog(logName, localPath string) (int, int) {
+func checkPutResumeLog(logName, localPath string) (int, int, int) {
 	rl, stale := readResumeLog(logName, localPath)
 	if stale {
 		os.Remove(logName) // stale log for a different file
-		return 0, 0
+		return 0, 0, 0
 	}
 	if rl == nil {
-		return 0, 0 // no log -> fresh start
+		return 0, 0, 0 // no log -> fresh start
 	}
 	if rl.blockLines == 0 {
-		return 0, rl.total // header only, nothing sent yet
+		return 0, rl.total, rl.blockSize // header only, nothing sent yet
 	}
 	// The block lines must be a clean 0..N-1 run: no malformed lines, no gaps,
 	// no out-of-order numbers.
 	if len(rl.blocks) != rl.blockLines {
 		os.Remove(logName) // a malformed line: corrupt log
-		return 0, 0
+		return 0, 0, 0
 	}
 	for i, b := range rl.blocks {
 		if b.num != i {
 			os.Remove(logName) // gap or out-of-order: corrupt log
-			return 0, 0
+			return 0, 0, 0
 		}
 	}
-	return len(rl.blocks), rl.total // N blocks sent (lines 1..N)
+	return len(rl.blocks), rl.total, rl.blockSize // N blocks sent (lines 1..N)
 }
 
 // readPutLogChecksums reads the local !put resume log and returns a map of
@@ -205,7 +223,7 @@ func putAbort(suppress *int32, remotePath string) {
 // `head -n N | base64 -d` (see putCmdLine for why that survives multi-hop
 // chains); a corrupt transfer fails the size guard and never clobbers the
 // existing target file.
-func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePath string, logMode int, logFile string) {
+func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePath string, logMode int, logFile string, rateLimit int64) {
 	lf, err := os.Open(localPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] open %s: %v\033[0m\n", localPath, err)
@@ -215,7 +233,8 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 
 	lstat, _ := lf.Stat()
 	fileSize := lstat.Size()
-	totalBlocks := (int(fileSize) + tpBlockSize - 1) / tpBlockSize
+	blockSize := blockSizeForRate(rateLimit)
+	totalBlocks := (int(fileSize) + blockSize - 1) / blockSize
 
 	qTarget, okT := dq(remotePath)
 	tmpOut := remotePath + ".tptmp"
@@ -231,18 +250,19 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	}
 
 	// Resume decision. When logging is on and a previous run left a valid log, we
-	// know how many blocks we already sent. We probe the remote for the size of
-	// its partial temp file (K = size/4MiB complete blocks), then verify the last
-	// few complete blocks against the log's checksums. We resume from the newest
-	// intact block (truncating any corrupt trailing blocks off the temp first);
-	// if none of the recent blocks match we report it and re-upload the whole
-	// file. The final whole-file sha256 is the backstop for anything weirder.
+	// know how many blocks we already sent (and the block size it used). We probe
+	// the remote for the size of its partial temp file (K = size/blockSize), then
+	// verify the last few complete blocks against the log's checksums.
 	resumeFrom := 0
 	if logMode == 1 {
-		sent, _ := checkPutResumeLog(logFile, localPath)
+		sent, _, logBS := checkPutResumeLog(logFile, localPath)
+		if sent > 0 && logBS > 0 {
+			blockSize = logBS
+			totalBlocks = (int(fileSize) + blockSize - 1) / blockSize
+		}
 		if sent > 0 && sent <= totalBlocks {
 			if remoteSize, ok := probeRemoteTmpSize(injectCh, qTmp); ok {
-				K := int(remoteSize / int64(tpBlockSize)) // complete blocks on the remote
+				K := int(remoteSize / int64(blockSize)) // complete blocks on the remote
 				if K > 0 && K <= sent {
 					// The last up-to-5 complete blocks, oldest -> newest.
 					lo := K - 5
@@ -253,7 +273,7 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 					for i := lo; i < K; i++ {
 						blocks[i-lo] = i
 					}
-					remoteCk, ok2 := probeRemoteCksums(injectCh, qTmp, blocks)
+					remoteCk, ok2 := probeRemoteCksums(injectCh, qTmp, blocks, blockSize)
 					logCk := readPutLogChecksums(logFile, localPath)
 					if ok2 && logCk != nil && len(remoteCk) == len(blocks) {
 						// Newest block whose checksum matches the log wins.
@@ -265,13 +285,8 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 						}
 						if match >= 0 {
 							resumeFrom = match + 1
-							// Drop any trailing bytes past the last good block — corrupt
-							// blocks, or a partial block left by a mid-block Ctrl+C — so
-							// the append starts on a clean boundary. Truncating to exactly
-							// resumeFrom full blocks is a no-op when the temp already ends
-							// there; skip it once everything is sent.
 							if resumeFrom < totalBlocks {
-								if !injectWait(injectCh, []byte(truncateCmd(qTmp, int64(resumeFrom), setEchoNonce()))) {
+								if !injectWait(injectCh, []byte(truncateCmd(qTmp, int64(resumeFrom), blockSize, setEchoNonce()))) {
 									putAbort(suppress, remotePath)
 									return
 								}
@@ -281,19 +296,27 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 						} else {
 							errf("remote temp is corrupt (no recent block matches the log); re-uploading whole file")
 							os.Remove(logFile)
+							blockSize = blockSizeForRate(rateLimit)
+							totalBlocks = (int(fileSize) + blockSize - 1) / blockSize
 						}
 					} else {
 						// Couldn't verify (no xxh64sum, timeout, ...): re-upload.
 						os.Remove(logFile)
+						blockSize = blockSizeForRate(rateLimit)
+						totalBlocks = (int(fileSize) + blockSize - 1) / blockSize
 					}
 				} else {
 					// Temp size doesn't line up with what we sent: re-upload.
 					os.Remove(logFile)
+					blockSize = blockSizeForRate(rateLimit)
+					totalBlocks = (int(fileSize) + blockSize - 1) / blockSize
 				}
 			}
 		} else if sent > totalBlocks {
 			// Stale log from a larger/different file: discard and start fresh.
 			os.Remove(logFile)
+			blockSize = blockSizeForRate(rateLimit)
+			totalBlocks = (int(fileSize) + blockSize - 1) / blockSize
 		}
 	}
 
@@ -308,27 +331,23 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	sendSize := fileSize
 	resume := resumeFrom > 0
 	if resume {
-		sendSize = fileSize - int64(resumeFrom)*int64(tpBlockSize)
+		sendSize = fileSize - int64(resumeFrom)*int64(blockSize)
 		if sendSize < 0 {
 			sendSize = 0 // all blocks already present; just finalize (move temp)
 		}
 	}
 
 	nonce := setEchoNonce()
-	cmdLine, numLines := putCmdLine(qTarget, qTmp, sendSize, fileSize, resume, nonce)
+	cmdLine, numLines := putCmdLine(qTarget, qTmp, sendSize, fileSize, resume, rateLimit, nonce)
 	if len(cmdLine) > 4095 {
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] remote path too long for line-based upload\033[0m\n")
 		return
 	}
 
-	// Hash the local file up front so we can verify after the upload. This
-	// deliberately reads the file a second time (the transfer below re-reads it):
-	// that snapshot IS the consistency check. If the file is edited mid-upload,
-	// the bytes we send no longer hash to this value, and the mismatch is reported
-	// instead of a torn file being silently accepted.
+	// Hash the local file up front so we can verify after the upload.
 	localSha := sha256FileHandle(lf)
 	// For a resume, skip the blocks we already sent (the remote has them).
-	lf.Seek(int64(resumeFrom)*int64(tpBlockSize), io.SeekStart)
+	lf.Seek(int64(resumeFrom)*int64(blockSize), io.SeekStart)
 
 	// Open the resume log. Fresh upload: create it and write the header. Resume:
 	// append to it (the header + already-sent blocks are already recorded).
@@ -340,7 +359,11 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		} else {
 			logF, lerr = os.Create(logFile)
 			if lerr == nil {
-				fmt.Fprintf(logF, "%s %d\n", localPath, totalBlocks)
+				if blockSize != tpBlockSize {
+					fmt.Fprintf(logF, "%s %d %d\n", localPath, totalBlocks, blockSize)
+				} else {
+					fmt.Fprintf(logF, "%s %d\n", localPath, totalBlocks)
+				}
 			}
 		}
 		if lerr != nil {
@@ -350,8 +373,12 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		defer logF.Close()
 	}
 
-	fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ↑ ./%s (%s) → %s\033[0m\n",
-		localPath, humanSize(fileSize), remotePath)
+	rateTag := ""
+	if rateLimit > 0 {
+		rateTag = fmt.Sprintf(" [limit %s/s, block %s]", humanSize(rateLimit), humanSize(int64(blockSize)))
+	}
+	fmt.Fprintf(os.Stderr, "\n\033[1;33m[tp] ↑ ./%s (%s) → %s%s\033[0m\n",
+		localPath, humanSize(fileSize), remotePath, rateTag)
 
 	// Register for verification
 	resultCh := make(chan string, 1)
@@ -399,13 +426,31 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 
 	// Stream exactly numLines lines of continuous base64. head exits after
 	// reading them, so no EOF/^D is needed (see putCmdLine).
+	lineLen := putLineLenForRate(rateLimit)
 	buf := make([]byte, 24*1024)
-	pending := make([]byte, 0, putDataLineLen+8192)
+	pending := make([]byte, 0, lineLen+8192)
 	var sent int64
+	var wireBytes int64
 	linesSent := 0
 	start := time.Now()
 	var putTicker progressTicker
 	putTicker.start(0)
+
+	sendLine := func(ln []byte) bool {
+		payload := append(append([]byte{}, ln...), '\n')
+		if !injectWait(injectCh, payload) {
+			return false
+		}
+		linesSent++
+		if rateLimit > 0 {
+			wireBytes += int64(len(payload))
+			wantElapsed := time.Duration(float64(wireBytes) / float64(rateLimit) * float64(time.Second))
+			if wait := wantElapsed - time.Since(start); wait > 0 {
+				time.Sleep(wait)
+			}
+		}
+		return true
+	}
 
 	for {
 		n, rerr := io.ReadFull(lf, buf)
@@ -415,10 +460,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 		}
 		if n > 0 {
 			if logF != nil {
-				// Feed the block hash, splitting at the 4MiB boundary if this read
+				// Feed the block hash, splitting at the blockSize boundary if this read
 				// straddles it (a read is <=24KiB, so it can cross at most one
 				// boundary). When the boundary is hit, log the just-finished block.
-				remaining := int64(tpBlockSize) - blockBytes
+				remaining := int64(blockSize) - blockBytes
 				if int64(n) <= remaining {
 					blockHash.Write(buf[:n])
 					blockBytes += int64(n)
@@ -434,19 +479,18 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 			pending = append(pending, base64.StdEncoding.EncodeToString(buf[:n])...)
 			sent += int64(n)
 			// Emit complete data lines (copy: pending's backing array is reused)
-			for len(pending) >= putDataLineLen {
-				if !injectWait(injectCh, append(append([]byte{}, pending[:putDataLineLen]...), '\n')) {
+			for len(pending) >= lineLen {
+				if !sendLine(pending[:lineLen]) {
 					putAbort(suppress, remotePath)
 					return
 				}
-				pending = pending[putDataLineLen:]
-				linesSent++
+				pending = pending[lineLen:]
 
 				if due, speed := putTicker.tick(sent); due {
 					// Show the total file position (blocks already on the remote +
 					// bytes sent this run), not just this run's byte count, so a
 					// resume starts at the right percentage instead of 0%.
-					pos := int64(resumeFrom)*int64(tpBlockSize) + sent
+					pos := int64(resumeFrom)*int64(blockSize) + sent
 					pct := 0.0
 					if fileSize > 0 {
 						pct = float64(pos) / float64(fileSize) * 100
@@ -462,11 +506,10 @@ func doNoRemotePut(injectCh chan<- []byte, suppress *int32, localPath, remotePat
 	}
 	// Flush the final partial line
 	if len(pending) > 0 {
-		if !injectWait(injectCh, append(append([]byte{}, pending...), '\n')) {
+		if !sendLine(pending) {
 			putAbort(suppress, remotePath)
 			return
 		}
-		linesSent++
 	}
 	// Log the last (possibly partial) block's checksum, if any bytes were left.
 	if logF != nil && blockBytes > 0 {

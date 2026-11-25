@@ -274,7 +274,12 @@ func handleLine(line []byte, cap *captureState) {
 		logName := getLog.logName
 		resumeFrom := getLog.resumeFrom
 		resumeSize := getLog.resumeSize
+		blockSize := getLog.blockSize
 		getLog.mu.Unlock()
+		if blockSize <= 0 {
+			blockSize = tpBlockSize
+		}
+		cap.blocksize = blockSize
 
 		if logEnabled {
 			if logName == "" {
@@ -315,7 +320,11 @@ func handleLine(line []byte, cap *captureState) {
 					return
 				}
 				cap.logFile = lf
-				fmt.Fprintf(lf, "%s %d\n", name, cap.totalBlocks)
+				if cap.blocksize != tpBlockSize {
+					fmt.Fprintf(lf, "%s %d %d\n", name, cap.totalBlocks, cap.blocksize)
+				} else {
+					fmt.Fprintf(lf, "%s %d\n", name, cap.totalBlocks)
+				}
 				lf.Sync()
 				fmt.Fprintf(os.Stderr, "\n\033[1;36m[tp] ↓ %s → ./%s (resumable)\033[0m\n", humanSize(cap.totalSize), name)
 			}
@@ -529,23 +538,29 @@ func tmpSizeProbe(qTmp, nonce string) string {
 
 // cksumProbe reports the xxh64 checksums of the given 0-based block indices of
 // the upload's partial temp file, as "__TP_CKSUM__ #<nonce> <c1> <c2> ...". Each
-// block is a 4MiB slice hashed with xxh64 (matching the local log); if the remote
-// lacks xxh64sum the fields come back empty and the caller re-uploads.
-func cksumProbe(qTmp string, blocks []int, nonce string) string {
+// block is a blockSize slice hashed with xxh64 (matching the local log); if the
+// remote lacks xxh64sum the fields come back empty and the caller re-uploads.
+func cksumProbe(qTmp string, blocks []int, blockSize int, nonce string) string {
+	if blockSize <= 0 {
+		blockSize = tpBlockSize
+	}
 	list := make([]string, len(blocks))
 	for i, b := range blocks {
 		list[i] = strconv.Itoa(b)
 	}
 	return leadSpace + fmt.Sprintf(
-		"echo %s \"#%s\" $(for i in %s; do dd if=%s bs=4M skip=$i count=1 2>/dev/null | xxh64sum 2>/dev/null | awk '{print $1}'; done | tr '\\n' ' ')\n",
-		splitMarker(TPCksum), nonce, strings.Join(list, " "), qTmp)
+		"echo %s \"#%s\" $(for i in %s; do dd if=%s bs=%d skip=$i count=1 2>/dev/null | xxh64sum 2>/dev/null | awk '{print $1}'; done | tr '\\n' ' ')\n",
+		splitMarker(TPCksum), nonce, strings.Join(list, " "), qTmp, blockSize)
 }
 
-// truncateCmd truncates the partial temp file to exactly nBlocks complete 4MiB
-// blocks, dropping any corrupt trailing blocks. It prefers the (cheap,
-// metadata-only) `truncate` and falls back to a copy on BSD/macOS.
-func truncateCmd(qTmp string, nBlocks int64, nonce string) string {
-	size := nBlocks * int64(tpBlockSize)
+// truncateCmd truncates the partial temp file to exactly nBlocks complete
+// blocks of blockSize bytes, dropping any corrupt trailing blocks. It prefers
+// the (cheap, metadata-only) `truncate` and falls back to a copy on BSD/macOS.
+func truncateCmd(qTmp string, nBlocks int64, blockSize int, nonce string) string {
+	if blockSize <= 0 {
+		blockSize = tpBlockSize
+	}
+	size := nBlocks * int64(blockSize)
 	return leadSpace + fmt.Sprintf("truncate -s %d %s 2>/dev/null || { head -c %d %s > %s.trunc && mv -f %s.trunc %s; } #%s\n",
 		size, qTmp, size, qTmp, qTmp, qTmp, qTmp, nonce)
 }
@@ -611,7 +626,7 @@ func probeRemoteTmpSize(injectCh chan<- []byte, qTmp string) (int64, bool) {
 // timeout (the caller then falls back to a full re-upload, which is always
 // safe). The returned slice has one entry per requested block, in order; an
 // entry is empty if that block couldn't be read/hashed.
-func probeRemoteCksums(injectCh chan<- []byte, qTmp string, blocks []int) ([]string, bool) {
+func probeRemoteCksums(injectCh chan<- []byte, qTmp string, blocks []int, blockSize int) ([]string, bool) {
 	nonce := setEchoNonce()
-	return probeRemote(injectCh, cksumProbe(qTmp, blocks, nonce), 15*time.Second, func(ch chan []string) { putGuard.cksumCh = ch })
+	return probeRemote(injectCh, cksumProbe(qTmp, blocks, blockSize, nonce), 15*time.Second, func(ch chan []string) { putGuard.cksumCh = ch })
 }

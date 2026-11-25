@@ -6,8 +6,53 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// parseRateLimit parses a human-readable byte rate such as "20K", "500k",
+// "2M", "10000", or "20KB" into bytes per second.
+func parseRateLimit(s string) (int64, error) {
+	raw := strings.TrimSpace(s)
+	if raw == "" {
+		return 0, fmt.Errorf("empty rate limit")
+	}
+	u := strings.ToUpper(raw)
+	u = strings.TrimSuffix(u, "/S")
+	u = strings.TrimSuffix(u, "B")
+	mult := int64(1)
+	switch {
+	case strings.HasSuffix(u, "K"):
+		mult = 1024
+		u = strings.TrimSuffix(u, "K")
+	case strings.HasSuffix(u, "M"):
+		mult = 1024 * 1024
+		u = strings.TrimSuffix(u, "M")
+	case strings.HasSuffix(u, "G"):
+		mult = 1024 * 1024 * 1024
+		u = strings.TrimSuffix(u, "G")
+	}
+	n, err := strconv.ParseInt(u, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("invalid rate limit %q (expected e.g. 20K, 500K, 2M)", s)
+	}
+	return n * mult, nil
+}
+
+// expandLocalPath expands a leading "~/" to the local user's home directory.
+func expandLocalPath(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if p == "~" {
+				return home
+			}
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
+}
 
 func humanSize(n int64) string {
 	const (

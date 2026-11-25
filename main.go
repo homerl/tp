@@ -35,8 +35,9 @@ Usage:
   tp version
 
 In-session commands (type these in the tp ssh terminal):
-  get@! <remote_path> [local_name]   Download a remote file
-  put@! <local_path> [remote_path]   Upload a local file
+  get@! [-l <rate>] <remote_path> [local_name]   Download a remote file
+  put@! [-l <rate>] <local_path> [remote_path]   Upload a local file
+  (-l 20K / -r 20K limits transfer rate to 20 KiB/s; default unlimited)
 
 Workflow:
   $ tp ssh jump1              # instead of 'ssh jump1'

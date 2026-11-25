@@ -65,7 +65,7 @@ func runPutOverPTY(t *testing.T, w ptyWriter, sizeMB int) putResult {
 	if !okT || !okO {
 		t.Fatal("dq rejected test path")
 	}
-	cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false, "testnonce0000000")
+	cmdLine, numLines := putCmdLine(qTarget, qTmp, int64(len(orig)), int64(len(orig)), false, 0, "testnonce0000000")
 
 	w.write([]byte(fmt.Sprintf("rm -f %s 2>/dev/null\n", qTmp)))
 	time.Sleep(300 * time.Millisecond)
@@ -370,7 +370,7 @@ func TestPTYDownloadRoundTrip(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	localName := "downloaded.bin"
-	doNoRemoteGet(injectCh, remotePath, localName, 0, "")
+	doNoRemoteGet(injectCh, remotePath, localName, 0, "", 0)
 
 	// Wait for the download to finish: capture ends and the file exists.
 	deadline := time.Now().Add(90 * time.Second)
@@ -515,7 +515,7 @@ func TestPTYDownloadResumeRoundTrip(t *testing.T) {
 
 	// Start the download with logging on. checkResumeLog should detect the
 	// partial state and resume from block 1 (skipping block 0).
-	doNoRemoteGet(injectCh, remotePath, localName, 1, "")
+	doNoRemoteGet(injectCh, remotePath, localName, 1, "", 0)
 
 	// Wait for the download to finish: capture ends and the file is complete.
 	deadline := time.Now().Add(90 * time.Second)
@@ -667,7 +667,7 @@ func TestPTYUploadResumeRoundTrip(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	var suppress int32
-	doNoRemotePut(injectCh, &suppress, localPath, remotePath, 1, "")
+	doNoRemotePut(injectCh, &suppress, localPath, remotePath, 1, "", 0)
 
 	// Wait for the upload to finish: the remote target reaches full size.
 	deadline := time.Now().Add(90 * time.Second)
@@ -807,7 +807,7 @@ func TestPTYUploadResumeCorruptTail(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	var suppress int32
-	doNoRemotePut(injectCh, &suppress, localPath, remotePath, 1, "")
+	doNoRemotePut(injectCh, &suppress, localPath, remotePath, 1, "", 0)
 
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
@@ -943,7 +943,7 @@ func TestPTYUploadResumePartialTail(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // let bash start
 
 	var suppress int32
-	doNoRemotePut(injectCh, &suppress, localPath, remotePath, 1, "")
+	doNoRemotePut(injectCh, &suppress, localPath, remotePath, 1, "", 0)
 
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
@@ -1166,7 +1166,7 @@ func TestPTYPutConfirmRoundTrip(t *testing.T) {
 			}()
 
 			var suppress int32
-			doNoRemotePut(injectCh, &suppress, "local.bin", remotePath, 0, "")
+			doNoRemotePut(injectCh, &suppress, "local.bin", remotePath, 0, "", 0)
 
 			// Wait for the target to reach the expected content (overwrite or not).
 			deadline := time.Now().Add(30 * time.Second)
@@ -1279,7 +1279,7 @@ func TestPTYGetConfirmRoundTrip(t *testing.T) {
 				}
 			}()
 
-			doNoRemoteGet(injectCh, remotePath, "local.bin", 0, "")
+			doNoRemoteGet(injectCh, remotePath, "local.bin", 0, "", 0)
 
 			deadline := time.Now().Add(30 * time.Second)
 			for time.Now().Before(deadline) {
@@ -1397,7 +1397,7 @@ func TestPutAbortsWhenLinkDies(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		doNoRemotePut(injectCh, &suppress, localPath, filepath.Join(dir, "remote.bin"), 0, "")
+		doNoRemotePut(injectCh, &suppress, localPath, filepath.Join(dir, "remote.bin"), 0, "", 0)
 	}()
 
 	// Cut the link once the upload is provably in flight. A fixed sleep used to
@@ -1503,7 +1503,7 @@ func TestPTYHistoryRecallVisible(t *testing.T) {
 // link in the path. The upload command turns echo off for the data phase and
 // back on before it reports the checksum.
 func TestPutCmdLineSilencesRemoteEcho(t *testing.T) {
-	line, _ := putCmdLine("/tmp/t", "/tmp/t.tptmp", 4096, 4096, false, "nonce1")
+	line, _ := putCmdLine("/tmp/t", "/tmp/t.tptmp", 4096, 4096, false, 0, "nonce1")
 	off := strings.Index(line, "stty -echo")
 	on := strings.Index(line, "stty echo")
 	head := strings.Index(line, "head -n")

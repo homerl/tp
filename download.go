@@ -456,9 +456,67 @@ func quietNote(name string, got, total int64, begun bool, silent time.Duration, 
 		what, silent.Round(time.Second), have)
 }
 
-func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode int, logFile string) {
+// blockSizeForRate picks the per-block checksum/resume unit for a given wire
+// rate limit. Unlimited transfers use 4 MiB; rate-limited transfers scale the
+// block size down so each block takes ~15-20s (between 64 KiB and 4 MiB), so
+// an interrupted or dropped block on a throttled bastion loses seconds rather
+// than minutes.
+func blockSizeForRate(rateLimit int64) int {
+	if rateLimit <= 0 {
+		return tpBlockSize
+	}
+	target := rateLimit * 3 / 4 * 15
+	for _, sz := range []int{
+		64 * 1024,
+		128 * 1024,
+		256 * 1024,
+		512 * 1024,
+		1024 * 1024,
+		2 * 1024 * 1024,
+		tpBlockSize,
+	} {
+		if int64(sz) >= target {
+			return sz
+		}
+	}
+	return tpBlockSize
+}
+
+// downloadB64Cmd returns the remote shell snippet that base64-encodes
+// $TPDIR/.tpblk.$$. When rateLimit > 0 (bytes/sec on the wire), it prefers
+// `pv -q -L` if available and falls back to pacing `base64 -w <chunk>` lines
+// with fractional `sleep`, keeping bursts small so bastion buffers do not
+// overflow.
+func downloadB64Cmd(rateLimit int64) string {
+	if rateLimit <= 0 {
+		return "base64 -w 32000 $TPDIR/.tpblk.$$ 2>/dev/null || base64 $TPDIR/.tpblk.$$"
+	}
+	// Target ~10 chunks/sec (100ms per line) with small bursts (256..4096 B).
+	// For high limits (>400 KB/s), scale chunk up to 32000 B at ~20ms/line.
+	chunk := rateLimit / 10
+	if chunk < 256 {
+		chunk = 256
+	}
+	if chunk > 4096 {
+		chunk = 4096
+		if rateLimit > 4096*50 {
+			chunk = rateLimit / 50
+			if chunk > 32000 {
+				chunk = 32000
+			}
+		}
+	}
+	sleepSec := float64(chunk) / float64(rateLimit)
+	return fmt.Sprintf(
+		"if command -v pv >/dev/null 2>&1; then (base64 -w 4096 $TPDIR/.tpblk.$$ 2>/dev/null || base64 $TPDIR/.tpblk.$$) | pv -q -L %d; else (base64 -w %d $TPDIR/.tpblk.$$ 2>/dev/null || base64 $TPDIR/.tpblk.$$) | while IFS= read -r L; do printf '%%s\\n' \"$L\"; sleep %.3f; done; fi",
+		rateLimit, chunk, sleepSec)
+}
+
+func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode int, logFile string, rateLimit int64) {
 	if localPath == "" {
 		localPath = filepath.Base(remotePath)
+	} else {
+		localPath = expandLocalPath(localPath)
 	}
 
 	// Quote the remote path exactly like !put does (dq rejects quotes/$/
@@ -488,11 +546,17 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 
 	// Resume check: if logging is on and a log + partial temp exist, verify the
 	// last recorded block and, if it checks out, start the transfer from the next
-	// block instead of byte 0. On any mismatch we fall back to a fresh download.
+	// block instead of byte 0 (reusing the block size recorded in the log so
+	// resuming with a different rate limit still aligns on block boundaries).
+	blockSize := blockSizeForRate(rateLimit)
 	resumeFrom := 0
 	resumeSize := int64(0)
 	if logMode == 1 {
-		resumeFrom, resumeSize = checkResumeLog(logFile, localPath)
+		var logBS int
+		resumeFrom, resumeSize, logBS = checkResumeLogWithBlockSize(logFile, localPath)
+		if resumeFrom > 0 && logBS > 0 {
+			blockSize = logBS
+		}
 	}
 
 	// Guard: if the local target already exists and we are NOT resuming, confirm
@@ -520,44 +584,34 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 	getLog.logName = logFile
 	getLog.resumeFrom = resumeFrom
 	getLog.resumeSize = resumeSize
+	getLog.blockSize = blockSize
 	getLog.mu.Unlock()
 
 	nonce := setEchoNonce()
+	rateTag := ""
+	if rateLimit > 0 {
+		rateTag = fmt.Sprintf(" [limit %s/s, block %s]", humanSize(rateLimit), humanSize(int64(blockSize)))
+	}
 	if resumeFrom > 0 {
-		fmt.Fprintf(os.Stderr, "\n\033[1;36m[tp] ↻ %s → ./%s (resume from block %d)\033[0m\n", remotePath, localPath, resumeFrom)
+		fmt.Fprintf(os.Stderr, "\n\033[1;36m[tp] ↻ %s → ./%s (resume from block %d)%s\033[0m\n", remotePath, localPath, resumeFrom, rateTag)
 	} else {
-		fmt.Fprintf(os.Stderr, "\n\033[1;36m[tp] ↓ %s → ./%s\033[0m\n", remotePath, localPath)
+		fmt.Fprintf(os.Stderr, "\n\033[1;36m[tp] ↓ %s → ./%s%s\033[0m\n", remotePath, localPath, rateTag)
 	}
 
-	// Per-block one-liner: the remote splits the file into 4 MiB blocks and, for
-	// each, emits a __TP_BLOCK__ <n> <checksum> marker followed by that block's
-	// base64. The local side verifies each block's checksum as it arrives and
-	// logs it, so an interrupted transfer resumes from the last good block. The
-	// checksum prefers xxh64 (fast, 16 hex chars) and falls back to sha256 (64
-	// hex chars) when the remote lacks xxh64sum; the local detects which by the
-	// checksum length. Portable tools: stat/xxh64sum|sha256sum/base64 each have
-	// GNU→BSD fallbacks. We start at N=$resumeFrom so a resume skips the blocks
-	// already on disk.
-	//
-	// NOTE on quoting: qRemote uses are standalone command args (double-quoting
-	// correct). localPath (in the __TP_BEGIN__ echo) and remotePath (in the
-	// "no such file" echo) sit INSIDE a double-quoted echo string, so they stay
-	// raw — dq() already rejected quotes/$/backtick/backslash/!.
-	// The remote picks ONE hash tool up front (xxh64sum → sha256sum → shasum →
-	// sha256 → cksum) and aborts with __TP_ERROR__ if none exist — we never
-	// transfer without a checksum, so a corrupt stream can't be silently
-	// accepted. The local detects the algorithm by checksum length
-	// (8 = crc32/cksum, 16 = xxh64, 64 = sha256). The temp block file is
-	// written to /tmp if writable, otherwise to the current directory.
+	b64Cmd := downloadB64Cmd(rateLimit)
 	inject := leadSpace + fmt.Sprintf(
-		"if [ -f %s ]; then TPDIR=/tmp;[ -w /tmp ]||TPDIR=.; SZ=$(stat -c%%s %s 2>/dev/null || stat -f%%z %s 2>/dev/null); T=$(( (SZ + %d) / %d )); if command -v xxh64sum >/dev/null 2>&1; then H=xxh64sum;A='{print $1}'; elif command -v sha256sum >/dev/null 2>&1; then H=sha256sum;A='{print $1}'; elif command -v shasum >/dev/null 2>&1; then H=\"shasum -a 256\";A='{print $1}'; elif command -v sha256 >/dev/null 2>&1; then H=sha256;A='{print $1}'; elif command -v cksum >/dev/null 2>&1; then H=cksum;A='{printf \"%%08x\",$1}'; else echo \"%s no hash tool on remote (need xxh64sum/sha256sum/shasum/sha256/cksum)\"; fi; if [ -n \"$H\" ]; then echo \"%s|%s|$SZ|$T\"; N=%d; while [ $N -lt $T ]; do dd if=%s bs=%d skip=$N count=1 2>/dev/null > $TPDIR/.tpblk.$$; [ -s $TPDIR/.tpblk.$$ ] || break; S=$($H $TPDIR/.tpblk.$$ 2>/dev/null | awk \"$A\"); echo \"%s $N $S\"; base64 -w 32000 $TPDIR/.tpblk.$$ 2>/dev/null || base64 $TPDIR/.tpblk.$$; N=$((N+1)); done; rm -f $TPDIR/.tpblk.$$; echo %s; fi; else echo \"%s no such file: %s\"; fi #%s\n",
-		qRemote, qRemote, qRemote, tpBlockSize-1, tpBlockSize, splitMarker(TPError), splitMarker(TPBegin), localPath, resumeFrom, qRemote, tpBlockSize, splitMarker(TPBlock), splitMarker(TPDone), splitMarker(TPError), remotePath, nonce)
+		"if [ -f %s ]; then TPDIR=/tmp;[ -w /tmp ]||TPDIR=.; SZ=$(stat -c%%s %s 2>/dev/null || stat -f%%z %s 2>/dev/null); T=$(( (SZ + %d) / %d )); if command -v xxh64sum >/dev/null 2>&1; then H=xxh64sum;A='{print $1}'; elif command -v sha256sum >/dev/null 2>&1; then H=sha256sum;A='{print $1}'; elif command -v shasum >/dev/null 2>&1; then H=\"shasum -a 256\";A='{print $1}'; elif command -v sha256 >/dev/null 2>&1; then H=sha256;A='{print $1}'; elif command -v cksum >/dev/null 2>&1; then H=cksum;A='{printf \"%%08x\",$1}'; else echo \"%s no hash tool on remote (need xxh64sum/sha256sum/shasum/sha256/cksum)\"; fi; if [ -n \"$H\" ]; then echo \"%s|%s|$SZ|$T\"; N=%d; while [ $N -lt $T ]; do dd if=%s bs=%d skip=$N count=1 2>/dev/null > $TPDIR/.tpblk.$$; [ -s $TPDIR/.tpblk.$$ ] || break; S=$($H $TPDIR/.tpblk.$$ 2>/dev/null | awk \"$A\"); echo \"%s $N $S\"; %s; N=$((N+1)); done; rm -f $TPDIR/.tpblk.$$; echo %s; fi; else echo \"%s no such file: %s\"; fi #%s\n",
+		qRemote, qRemote, qRemote, blockSize-1, blockSize, splitMarker(TPError), splitMarker(TPBegin), localPath, resumeFrom, qRemote, blockSize, splitMarker(TPBlock), b64Cmd, splitMarker(TPDone), splitMarker(TPError), remotePath, nonce)
 	if len(inject) > 4095 {
 		fmt.Fprintf(os.Stderr, "\n\033[1;31m[tp] remote path too long for line-based download\033[0m\n")
 		return
 	}
 	dlWatchStart(remotePath)
-	injectCh <- []byte(inject)
+	if !injectWait(injectCh, []byte(inject)) {
+		dlWatchStop()
+		errf("connection lost; %s not downloaded", remotePath)
+		return
+	}
 }
 
 // checkResumeLog inspects a resume log and the matching partial temp file. It
@@ -567,53 +621,62 @@ func doNoRemoteGet(injectCh chan<- []byte, remotePath, localPath string, logMode
 // filename mismatch, missing/partial temp, or a last-block checksum mismatch
 // (in which case the stale log + temp are removed so the next run starts clean).
 func checkResumeLog(logName, localPath string) (int, int64) {
+	from, size, _ := checkResumeLogWithBlockSize(logName, localPath)
+	return from, size
+}
+
+func checkResumeLogWithBlockSize(logName, localPath string) (int, int64, int) {
 	rl, stale := readResumeLog(logName, localPath)
 	if stale {
 		// Log is for a different file: it's stale. Drop it and start fresh.
 		os.Remove(logName)
 		os.Remove(localPath + ".tptmp")
-		return 0, 0
+		return 0, 0, 0
 	}
 	if rl == nil || len(rl.blocks) < 1 {
-		return 0, 0 // no log, or header only, no blocks recorded
+		return 0, 0, 0 // no log, or header only, no blocks recorded
+	}
+	blockSize := rl.blockSize
+	if blockSize <= 0 {
+		blockSize = tpBlockSize
 	}
 	last := rl.blocks[len(rl.blocks)-1]
-	// The partial temp must exist and be exactly (last.num+1) full blocks long.
+	// The partial temp must exist and be at least (last.num+1) full blocks long.
 	tmpName := localPath + ".tptmp"
 	fi, err := os.Stat(tmpName)
 	if err != nil {
 		os.Remove(logName)
-		return 0, 0
+		return 0, 0, 0
 	}
 	resumeFrom := last.num + 1
-	wantSize := int64(resumeFrom) * int64(tpBlockSize)
+	wantSize := int64(resumeFrom) * int64(blockSize)
 	// The temp must hold at least the recorded blocks. A Ctrl+C mid-block leaves
 	// a partial trailing block (the temp is between wantSize and wantSize+block),
 	// so we truncate it back to the last complete block before resuming. Anything
 	// else — too small, or more than one extra block — is corrupt: start fresh.
-	if fi.Size() < wantSize || fi.Size() >= wantSize+int64(tpBlockSize) {
+	if fi.Size() < wantSize || fi.Size() >= wantSize+int64(blockSize) {
 		os.Remove(logName)
 		os.Remove(tmpName)
-		return 0, 0
+		return 0, 0, 0
 	}
 	if fi.Size() > wantSize {
 		// Drop the partial trailing block so we resume on a clean block boundary.
 		if err := os.Truncate(tmpName, wantSize); err != nil {
 			os.Remove(logName)
 			os.Remove(tmpName)
-			return 0, 0
+			return 0, 0, 0
 		}
 	}
 	// Verify the last block's checksum by re-reading it from the temp file.
 	f, err := os.Open(tmpName)
 	if err != nil {
 		os.Remove(logName)
-		return 0, 0
+		return 0, 0, 0
 	}
 	defer f.Close()
-	if _, err := f.Seek(wantSize-int64(tpBlockSize), 0); err != nil {
+	if _, err := f.Seek(wantSize-int64(blockSize), 0); err != nil {
 		os.Remove(logName)
-		return 0, 0
+		return 0, 0, 0
 	}
 	// Detect the algorithm from the stored checksum's length (8 = crc32/cksum,
 	// 16 = xxh64, 64 = sha256) — it must match what the remote used when it
@@ -627,9 +690,9 @@ func checkResumeLog(logName, localPath string) (int, int64) {
 	default:
 		h = sha256.New()
 	}
-	if _, err := io.CopyN(h, f, int64(tpBlockSize)); err != nil {
+	if _, err := io.CopyN(h, f, int64(blockSize)); err != nil {
 		os.Remove(logName)
-		return 0, 0
+		return 0, 0, 0
 	}
 	var actual string
 	switch len(last.cksum) {
@@ -644,7 +707,7 @@ func checkResumeLog(logName, localPath string) (int, int64) {
 		// Last block doesn't match: the tail is corrupt. Start fresh.
 		os.Remove(logName)
 		os.Remove(tmpName)
-		return 0, 0
+		return 0, 0, 0
 	}
-	return resumeFrom, wantSize
+	return resumeFrom, wantSize, blockSize
 }

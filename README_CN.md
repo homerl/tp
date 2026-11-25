@@ -48,12 +48,13 @@ tp version
 在 `tp ssh` 的终端里直接输入：
 
 ```
-get@! <remote_path> [local_name] [-l 0|1] [-f <log_file>]
-put@! <local_path> [remote_path] [-l 0|1] [-f <log_file>]
+get@! [-l <rate>|0|1] [-f <log_file>] <remote_path> [local_name]
+put@! [-l <rate>|0|1] [-f <log_file>] <local_path> [remote_path]
 ```
 
 | 参数 | 说明 |
 |------|------|
+| `-l <rate>` / `-r <rate>` | 限速（**默认不限速**），如 `-l 20K`、`-l 500K`、`-l 2M`，防止堡垒机缓冲区溢出丢字（参数可放在路径前或路径后，本地路径支持 `~/` 展开） |
 | `-l 1` | 开启日志/断点续传（**默认就是 1**） |
 | `-l 0` | 关闭，纯传不记录 |
 | `-f <file>` | 自定义日志文件路径（默认会自动获取断点日志 `<目标文件名>.tprlog`） |
@@ -223,7 +224,7 @@ TP_DEBUG=1 TP_DEBUG_FILE=/tmp/tp.log tp ssh host   # 输出到文件
 
 1. tp 先探测远端目标是否存在（`__TP_EXISTS__`），存在则弹 y/N
 2. 注入 `head -n N | base64 -d > tmp` 命令
-3. 本地按 3765 字符/行把 base64 数据喂进 PTY（避开 4096 行缓冲限制）
+3. 本地按 4000 字符/行把 base64 数据喂进 PTY（避开 4096 行缓冲限制；开启 `-l <rate>` 限速时自动缩短行宽并匀速发送）
 4. `head` 读满 N 行自动退出（不依赖 ^D，多层跳转安全）
 5. 远端校验临时文件大小 → rename 到目标 → 回报 sha256（`__TP_DONE__ <sha>`）
 6. 本地比对 sha256，通过才算成功

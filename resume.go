@@ -14,11 +14,12 @@ type logBlock struct {
 }
 
 // resumeLog is the parsed contents of a .tprlog file: the header (the local
-// filename it was created for and the total block count) plus every recorded
-// block in file order. !get and !put both write this same format.
+// filename it was created for, total block count, and optional block size) plus
+// every recorded block in file order. !get and !put both write this same format.
 type resumeLog struct {
 	name       string     // filename from the header
 	total      int        // total block count from the header
+	blockSize  int        // bytes per block (defaults to tpBlockSize if omitted in legacy logs)
 	blocks     []logBlock // successfully parsed blocks, in file order
 	blockLines int        // total block lines in the file (incl. malformed)
 }
@@ -46,7 +47,13 @@ func readResumeLog(logName, localPath string) (rl *resumeLog, stale bool) {
 	}
 	var total int
 	fmt.Sscanf(hdr[1], "%d", &total)
-	rl = &resumeLog{name: hdr[0], total: total, blockLines: len(lines) - 1}
+	blockSize := tpBlockSize
+	if len(hdr) >= 3 {
+		if bs, err := strconv.Atoi(hdr[2]); err == nil && bs > 0 {
+			blockSize = bs
+		}
+	}
+	rl = &resumeLog{name: hdr[0], total: total, blockSize: blockSize, blockLines: len(lines) - 1}
 	for _, ln := range lines[1:] {
 		f := strings.Fields(ln)
 		if len(f) < 2 {
