@@ -49,15 +49,15 @@ tp version
 Type directly in the `tp ssh` terminal:
 
 ```
-get@! [-l <rate>|0|1] [-f <log_file>] <remote_path> [local_name]
-put@! [-l <rate>|0|1] [-f <log_file>] <local_path> [remote_path]
+get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]
+put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]
 ```
 
 | Parameter | Description |
 |------|------|
-| `-l <rate>` / `-r <rate>` | Rate limit (**unlimited by default**), e.g. `-l 20K`, `-l 500K`, `-l 2M`, to prevent bastion buffer overflows (flags may appear before or after paths; local paths expand `~/`) |
-| `-l 1` | Enable logging / resumption (**default is 1**) |
-| `-l 0` | Disable, transfer without recording |
+| `-l <rate>` / `-r <rate>` | Rate limit (**unlimited by default**), e.g. `-l 20K`, `-l 500K`, `-l 2M`, to prevent bastion buffer overflows (uses 16 KiB blocks when rate-limited; flags may appear before or after paths; local paths expand `~/`) |
+| `-d 1` | Enable logging / resumption (**default is 1**) |
+| `-d 0` | Disable, transfer without recording |
 | `-f <file>` | Custom log file path (by default it auto-detects the resume log `<target filename>.tprlog`) |
 
 `!get` / `!put` work as well, for muscle memory. The bang trails the word in the

@@ -48,15 +48,15 @@ tp version
 在 `tp ssh` 的终端里直接输入：
 
 ```
-get@! [-l <rate>|0|1] [-f <log_file>] <remote_path> [local_name]
-put@! [-l <rate>|0|1] [-f <log_file>] <local_path> [remote_path]
+get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]
+put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]
 ```
 
 | 参数 | 说明 |
 |------|------|
-| `-l <rate>` / `-r <rate>` | 限速（**默认不限速**），如 `-l 20K`、`-l 500K`、`-l 2M`，防止堡垒机缓冲区溢出丢字（参数可放在路径前或路径后，本地路径支持 `~/` 展开） |
-| `-l 1` | 开启日志/断点续传（**默认就是 1**） |
-| `-l 0` | 关闭，纯传不记录 |
+| `-l <rate>` / `-r <rate>` | 限速（**默认不限速**），如 `-l 20K`、`-l 500K`、`-l 2M`，防止堡垒机缓冲区溢出丢字（开启限速时分块自动切换为 16 KiB；参数可放在路径前或路径后，本地路径支持 `~/` 展开） |
+| `-d 1` | 开启日志/断点续传（**默认就是 1**） |
+| `-d 0` | 关闭，纯传不记录 |
 | `-f <file>` | 自定义日志文件路径（默认会自动获取断点日志 `<目标文件名>.tprlog`） |
 
 `!get` / `!put` 也照旧能用。主写法把感叹号放到词尾，是因为 bash 只对后面跟着非空格/制表/换行的 `!` 做历史展开：行首的 `!get` 可能被 bash 拦下来报 `bash: !get: event not found`，而词尾的 `!` 是惰性的，一定能送到 tp 手里。命令按整词匹配，所以 `get@!x` 或者只是以 `get` 开头的行会交给 shell。

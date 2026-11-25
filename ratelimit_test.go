@@ -89,7 +89,7 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 			rate:    20 * 1024,
 		},
 		{
-			line:    "get@! /tmp/f local.bin -l 0 -r 50K",
+			line:    "get@! /tmp/f local.bin -d 0 -l 50K",
 			action:  "get",
 			arg1:    "/tmp/f",
 			arg2:    "local.bin",
@@ -97,7 +97,7 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 			rate:    50 * 1024,
 		},
 		{
-			line:    "get@! /tmp/f -l 1",
+			line:    "get@! /tmp/f -d 1",
 			action:  "get",
 			arg1:    "/tmp/f",
 			logMode: 1,
@@ -106,6 +106,11 @@ func TestParseLocalCmdFlexibleFlags(t *testing.T) {
 		{
 			line:    "put@! -l badrate /tmp/f",
 			action:  "put",
+			wantErr: true,
+		},
+		{
+			line:    "get@! -d 2 /tmp/f",
+			action:  "get",
 			wantErr: true,
 		},
 	}

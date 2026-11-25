@@ -252,7 +252,7 @@ type localCmd struct {
 	action    string
 	arg1      string
 	arg2      string
-	logMode   int    // -l 0|1: 0 = no log, 1 = resumable
+	logMode   int    // -d 0|1: 0 = no log, 1 = resumable
 	logFile   string // -f <file>: override the resume log name
 	rateLimit int64  // -l <rate> (e.g. 20K) or -r <rate>: bytes/sec limit (0 = unlimited)
 	parseErr  error  // non-nil when flag parsing failed
@@ -260,7 +260,7 @@ type localCmd struct {
 
 // parseLocalCmd parses an in-session command line (get@! / put@! / !get / !put)
 // allowing flags in any position (before, between, or after positional args).
-// `-l 0` / `-l 1` controls resume logging; `-l <rate>` (e.g. `-l 20K`) or
+// `-d 0` / `-d 1` controls resume logging; `-l <rate>` (e.g. `-l 20K`) or
 // `-r <rate>` sets the transfer rate limit in bytes/sec.
 func parseLocalCmd(parts []string) localCmd {
 	lc := localCmd{
@@ -269,24 +269,19 @@ func parseLocalCmd(parts []string) localCmd {
 	}
 	for i := 1; i < len(parts); i++ {
 		switch parts[i] {
-		case "-l":
+		case "-d":
 			if i+1 >= len(parts) {
-				lc.parseErr = fmt.Errorf("-l requires an argument (0|1 for log, or rate like 20K)")
+				lc.parseErr = fmt.Errorf("-d requires an argument (0 or 1)")
 				return lc
 			}
 			val := parts[i+1]
 			i++
-			if val == "0" || val == "1" {
-				fmt.Sscanf(val, "%d", &lc.logMode)
-			} else {
-				r, err := parseRateLimit(val)
-				if err != nil {
-					lc.parseErr = err
-					return lc
-				}
-				lc.rateLimit = r
+			if val != "0" && val != "1" {
+				lc.parseErr = fmt.Errorf("invalid -d value %q (expected 0 or 1)", val)
+				return lc
 			}
-		case "-r", "--limit":
+			fmt.Sscanf(val, "%d", &lc.logMode)
+		case "-l", "-r", "--limit":
 			if i+1 >= len(parts) {
 				lc.parseErr = fmt.Errorf("%s requires a rate argument (e.g. 20K, 1M)", parts[i])
 				return lc
@@ -347,7 +342,7 @@ var putGuard struct {
 // starts. enabled=false means plain (non-resumable) download.
 var getLog struct {
 	mu         sync.Mutex
-	enabled    bool   // -l 1: record a resume log
+	enabled    bool   // -d 1: record a resume log
 	logName    string // resume log path ("" = auto: <target>.tprlog)
 	resumeFrom int    // block to resume from (0 = fresh start)
 	resumeSize int64  // bytes already in the partial temp file
@@ -751,17 +746,17 @@ func cmdSSH(args []string) int {
 			switch lc.action {
 			case "get":
 				if lc.arg1 == "" {
-					fmt.Fprintln(os.Stderr, "\ntp: usage: get@! [-l <rate>|0|1] [-f <log_file>] <remote_path> [local_name]  (e.g. get@! -l 20K /tmp/f ~/Downloads/f)")
+					fmt.Fprintln(os.Stderr, "\ntp: usage: get@! [-l <rate>] [-d 0|1] [-f <log_file>] <remote_path> [local_name]  (e.g. get@! -l 20K /tmp/f ~/Downloads/f)")
 					continue
 				}
 				echoSup.clear() // don't let stale echo entries corrupt the marker/base64
 				if lc.logMode == -1 {
-					lc.logMode = 1 // resume by default; opt out with -l 0
+					lc.logMode = 1 // resume by default; opt out with -d 0
 				}
 				doNoRemoteGet(injectCh, lc.arg1, lc.arg2, lc.logMode, lc.logFile, lc.rateLimit)
 			case "put":
 				if lc.arg1 == "" {
-					fmt.Fprintln(os.Stderr, "\ntp: usage: put@! [-l <rate>|0|1] [-f <log_file>] <local_path> [remote_path]  (e.g. put@! -l 20K ~/f /tmp/f)")
+					fmt.Fprintln(os.Stderr, "\ntp: usage: put@! [-l <rate>] [-d 0|1] [-f <log_file>] <local_path> [remote_path]  (e.g. put@! -l 20K ~/f /tmp/f)")
 					continue
 				}
 				localPath := expandLocalPath(lc.arg1)
@@ -771,7 +766,7 @@ func cmdSSH(args []string) int {
 				}
 				echoSup.clear() // don't let stale echo entries corrupt the transfer
 				if lc.logMode == -1 {
-					lc.logMode = 1 // resume by default; opt out with -l 0
+					lc.logMode = 1 // resume by default; opt out with -d 0
 				}
 				doNoRemotePut(injectCh, &suppress, localPath, remotePath, lc.logMode, lc.logFile, lc.rateLimit)
 			}
